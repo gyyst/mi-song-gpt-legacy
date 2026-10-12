@@ -1,7 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, useAttrs } from 'vue';
-import { isWebFRuntime, useNativeSlider } from '../runtime';
-import { bindNativeAttrs } from './nativeProps';
+import { computed, onUnmounted, ref, useAttrs, watch } from 'vue';
 
 defineOptions({ inheritAttrs: false });
 
@@ -17,156 +15,113 @@ const props = withDefaults(
   }>(),
   { min: 0, max: 100, step: 1, orientation: 'horizontal' },
 );
-const emit = defineEmits<{ 'update:modelValue': [number]; change: [number] }>();
+const emit = defineEmits<{ 'update:modelValue': [number]; change: [number]; dragging: [boolean] }>();
 const attrs = useAttrs();
-const native = ref<HTMLElement | null>(null);
 const track = ref<HTMLElement | null>(null);
-// 必须走 attribute（不是 property）：`songloft_slider.dart` 只读 getAttribute。
-// 详见 nativeProps.ts 的 bindNativeAttrs 注释。
-bindNativeAttrs(native, () => ({
-  value: props.modelValue,
-  min: props.min,
-  max: props.max,
-  step: props.step,
-  disabled: !!props.disabled,
-  orientation: props.orientation,
-}));
-
-const useTouchFallback = computed(() => isWebFRuntime && !useNativeSlider);
+const shell = ref<HTMLElement | null>(null);
+const input = ref<HTMLInputElement | null>(null);
+const pointerId = ref<number | null>(null);
+const dragValue = ref(props.modelValue);
+const displayValue = computed(() => pointerId.value === null ? props.modelValue : dragValue.value);
 
 function valueFrom(event: Event): number {
-  const detail = (event as CustomEvent).detail;
-  return Number((event as InputEvent).data ?? detail ?? (event.target as HTMLInputElement).value);
+  return Number((event.target as HTMLInputElement).value);
 }
 
-function positionFromEvent(clientX: number, clientY: number): number {
+function positionFromEvent(clientY: number): number {
   const el = track.value;
   if (!el) return props.modelValue;
   const rect = el.getBoundingClientRect();
-  let ratio: number;
-  if (props.orientation === 'vertical') {
-    ratio = rect.height > 0 ? 1 - (clientY - rect.top) / rect.height : 0;
-  } else {
-    ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
-  }
-  ratio = Math.max(0, Math.min(1, ratio));
+  const ratio = Math.max(0, Math.min(1, rect.height > 0 ? 1 - (clientY - rect.top) / rect.height : 0));
   const value = props.min + ratio * (props.max - props.min);
-  return Math.round(value / props.step) * props.step;
+  const step = props.step > 0 ? props.step : 1;
+  return Math.max(props.min, Math.min(props.max, props.min + Math.round((value - props.min) / step) * step));
 }
 
-let dragging = false;
-
-function onTouchStart(event: TouchEvent): void {
-  if (props.disabled) return;
-  const touch = event.touches[0];
-  if (!touch) return;
-  dragging = true;
-  const val = positionFromEvent(touch.clientX, touch.clientY);
-  emit('update:modelValue', val);
+function updatePointer(event: PointerEvent): void {
+  dragValue.value = positionFromEvent(event.clientY);
+  emit('update:modelValue', dragValue.value);
 }
 
-function onTouchMove(event: TouchEvent): void {
-  if (!dragging) return;
-  const touch = event.touches[0];
-  if (!touch) return;
+function onPointerDown(event: PointerEvent): void {
+  if (props.orientation !== 'vertical' || props.disabled || pointerId.value !== null || event.button !== 0) return;
   event.preventDefault();
-  const val = positionFromEvent(touch.clientX, touch.clientY);
-  emit('update:modelValue', val);
+  pointerId.value = event.pointerId;
+  shell.value?.setPointerCapture(event.pointerId);
+  input.value?.focus({ preventScroll: true });
+  emit('dragging', true);
+  updatePointer(event);
 }
 
-function onTouchEnd(event: TouchEvent): void {
-  if (!dragging) return;
-  dragging = false;
-  const touch = event.changedTouches[0];
-  const val = touch ? positionFromEvent(touch.clientX, touch.clientY) : props.modelValue;
-  emit('change', val);
+function onPointerMove(event: PointerEvent): void {
+  if (pointerId.value !== event.pointerId) return;
+  updatePointer(event);
 }
 
-function onMouseDown(event: MouseEvent): void {
-  if (props.disabled) return;
-  dragging = true;
-  const val = positionFromEvent(event.clientX, event.clientY);
-  emit('update:modelValue', val);
-  document.addEventListener('mousemove', onMouseMove);
-  document.addEventListener('mouseup', onMouseUp);
+function releasePointer(): void {
+  const id = pointerId.value;
+  pointerId.value = null;
+  if (id !== null && shell.value?.hasPointerCapture(id)) shell.value.releasePointerCapture(id);
+  emit('dragging', false);
 }
 
-function onMouseMove(event: MouseEvent): void {
-  if (!dragging) return;
-  event.preventDefault();
-  const val = positionFromEvent(event.clientX, event.clientY);
-  emit('update:modelValue', val);
+function onPointerUp(event: PointerEvent): void {
+  if (pointerId.value !== event.pointerId) return;
+  updatePointer(event);
+  const value = dragValue.value;
+  releasePointer();
+  emit('change', value);
 }
 
-function onMouseUp(event: MouseEvent): void {
-  document.removeEventListener('mousemove', onMouseMove);
-  document.removeEventListener('mouseup', onMouseUp);
-  if (!dragging) return;
-  dragging = false;
-  const val = positionFromEvent(event.clientX, event.clientY);
-  emit('change', val);
+function cancelPointer(event?: PointerEvent): void {
+  if (event && pointerId.value !== event.pointerId) return;
+  if (pointerId.value === null) return;
+  releasePointer();
 }
 
-onUnmounted(() => {
-  document.removeEventListener('mousemove', onMouseMove);
-  document.removeEventListener('mouseup', onMouseUp);
+watch(() => props.disabled, (disabled) => {
+  if (disabled) cancelPointer();
 });
+onUnmounted(cancelPointer);
 
 const fillPercent = computed(() => {
   const range = props.max - props.min;
   if (range <= 0) return 0;
-  return Math.max(0, Math.min(100, ((props.modelValue - props.min) / range) * 100));
+  return Math.max(0, Math.min(100, ((displayValue.value - props.min) / range) * 100));
 });
+const thumbStyle = computed(() => ({ bottom: `calc(${fillPercent.value}% - ${fillPercent.value * .12}px)` }));
 </script>
 
 <template>
-  <div v-bind="attrs" class="sl-slider-wrap">
-    <songloft-slider
-      v-if="useNativeSlider"
-      ref="native"
-      class="sl-slider-native"
-      @input="emit('update:modelValue', valueFrom($event))"
-      @change="emit('change', valueFrom($event))"
-    />
-    <div
-      v-else-if="useTouchFallback"
-      ref="track"
-      class="sl-slider-touch"
-      :class="[`sl-slider-touch-${orientation}`]"
-      role="slider"
-      :aria-label="ariaLabel"
-      :aria-valuemin="min"
-      :aria-valuemax="max"
-      :aria-valuenow="modelValue"
-      @touchstart.passive="onTouchStart"
-      @touchmove="onTouchMove"
-      @touchend="onTouchEnd"
-      @touchcancel="onTouchEnd"
-      @mousedown="onMouseDown"
-    >
-      <div class="sl-slider-touch-track">
-        <div
-          class="sl-slider-touch-fill"
-          :style="orientation === 'vertical' ? { height: fillPercent + '%' } : { width: fillPercent + '%' }"
-        ></div>
+  <div
+    ref="shell"
+    v-bind="attrs"
+    class="sl-slider-wrap"
+    :class="{ 'sl-slider-vertical': orientation === 'vertical', 'sl-slider-vertical-disabled': orientation === 'vertical' && disabled }"
+    @pointerdown="onPointerDown"
+    @pointermove="onPointerMove"
+    @pointerup="onPointerUp"
+    @pointercancel="cancelPointer"
+    @lostpointercapture="cancelPointer"
+  >
+    <template v-if="orientation === 'vertical'">
+      <div ref="track" class="sl-slider-vertical-track" aria-hidden="true">
+        <div class="sl-slider-vertical-fill" :style="{ height: fillPercent + '%' }"></div>
       </div>
-      <div
-        class="sl-slider-touch-thumb"
-        :style="orientation === 'vertical'
-          ? { bottom: fillPercent + '%' }
-          : { left: fillPercent + '%' }"
-      ></div>
-    </div>
+      <span class="sl-slider-vertical-thumb" :style="thumbStyle" aria-hidden="true"></span>
+    </template>
     <input
-      v-else
+      ref="input"
       class="sl-slider"
+      :class="{ 'sl-slider-vertical-input': orientation === 'vertical' }"
       type="range"
-      :value="modelValue"
+      :value="displayValue"
       :min="min"
       :max="max"
       :step="step"
       :disabled="disabled"
       :aria-label="ariaLabel"
+      :aria-orientation="orientation"
       @input="emit('update:modelValue', valueFrom($event))"
       @change="emit('change', valueFrom($event))"
     />

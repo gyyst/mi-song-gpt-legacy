@@ -1,4 +1,11 @@
-import { createRouter } from '@songloft/plugin-sdk';
+import { AIClient } from './ai/client';
+import { AIChatService } from './chat/service';
+import { SpeechService } from './chat/speech';
+import { PlaybackCoordinator } from './playback/coordinator';
+import { VoiceDispatcher } from './voicecmd/dispatcher';
+import { chatBody, registerChatHandlers } from './handlers/chat';
+import { WS_CHAT_PATH, handleChatWebSocket } from './ws/chat-stream';
+import { createRouter, parseQuery } from '@songloft/plugin-sdk';
 import type { HTTPRequest, HTTPResponse, WebSocketRequest, InboundWebSocket } from '@songloft/plugin-sdk';
 import { ConfigManager } from './config/manager';
 import { AccountManager } from './account/manager';
@@ -14,6 +21,7 @@ import { AIAnalyzer } from './voicecmd/ai_analyzer';
 import { getDefaultVoiceCommands } from './voicecmd/engine';
 import { IndexingManager } from './indexing/manager';
 import { MemoryService } from './memory';
+import { DLNAReceiver } from './receiver/receiver';
 
 // 导入所有handler注册函数
 import { registerAccountHandlers } from './handlers/account';
@@ -74,6 +82,9 @@ let conversationMonitor: ConversationMonitor;
 let voiceEngine: VoiceEngine;
 let indexingManager: IndexingManager;
 let memoryService: MemoryService;
+let dlnaReceiver: DLNAReceiver;
+let aiChat: AIChatService;
+let voiceDispatcher: VoiceDispatcher;
 
 async function onInit(): Promise<void> {
   songloft.log.info('mi-song-gpt 插件初始化...');
@@ -92,6 +103,8 @@ async function onInit(): Promise<void> {
   groupCoordinator = new GroupCoordinator(playlistManagerMap, minaService, configManager);
   // 加载分组快照，使 PlaylistManagerMap 能同步把分组设备解析到共享 manager（多房间共用一套播放列表）
   await playlistManagerMap.refreshGroups();
+  dlnaReceiver = new DLNAReceiver(configManager, minaService, playlistManagerMap);
+  await dlnaReceiver.init();
   memoryService = new MemoryService();
 
   // 注入状态推送依赖（WebSocket 订阅端点 /status/ws 使用）
@@ -111,7 +124,12 @@ async function onInit(): Promise<void> {
   conversationMonitor = new ConversationMonitor(accountManager, configManager);
   // 注入对话推送依赖（WebSocket 订阅端点 /conversation/ws 使用）
   initConversationStream(conversationMonitor);
-  voiceEngine = new VoiceEngine(configManager, accountManager, minaService, playlistManagerMap, indexingManager, new AIAnalyzer(), memoryService, groupCoordinator);
+  const aiClient = new AIClient();
+  voiceEngine = new VoiceEngine(configManager, accountManager, minaService, playlistManagerMap, indexingManager, new AIAnalyzer((run, current, scope) => aiClient.foregroundRequest(run, current, scope)), memoryService, groupCoordinator);
+
+  const playback = new PlaybackCoordinator(playlistManagerMap, minaService, configManager);
+  aiChat = new AIChatService(configManager, playback, new SpeechService(minaService), aiClient);
+  voiceDispatcher = new VoiceDispatcher(configManager, voiceEngine, aiChat, playback);
 
   const executor = new TaskExecutor(configManager, accountManager, minaService, playlistManagerMap, indexingManager, conversationMonitor, groupCoordinator, voiceEngine);
   scheduler = new Scheduler(configManager, executor);
@@ -141,7 +159,8 @@ async function onInit(): Promise<void> {
   registerConfigHandlers(router, configManager, conversationMonitor, scheduler, voiceEngine, memoryService);
   registerConversationHandlers(router, conversationMonitor, configManager);
   registerScheduleHandlers(router, scheduler, configManager);
-  registerVoiceCommandHandlers(router, configManager, accountManager, voiceEngine);
+  registerVoiceCommandHandlers(router, configManager, accountManager, voiceEngine, voiceDispatcher);
+  registerChatHandlers(router, configManager, aiChat);
   registerIndexingHandlers(router, indexingManager);
   registerMemoryHandlers(router, memoryService, configManager);
   registerLyricHandlers(router);
@@ -174,7 +193,7 @@ async function onInit(): Promise<void> {
 
   // 注册 VoiceEngine 回调（独立于启停生命周期）
   conversationMonitor.registerCallback('voice_engine', (msg) => {
-    return voiceEngine.handleMessage(msg);
+    voiceDispatcher.submit(msg);
   });
 
   // 根据配置启动后台服务
@@ -195,6 +214,10 @@ async function onInit(): Promise<void> {
 
 async function onDeinit(): Promise<void> {
   songloft.log.info('mi-song-gpt 插件停止...');
+  voiceDispatcher?.close();
+  aiChat?.close();
+  voiceEngine?.close();
+  await dlnaReceiver?.close();
   scheduler?.stop();
   conversationMonitor?.stop();
   playlistManagerMap?.cleanup();
@@ -209,7 +232,7 @@ async function onDeinit(): Promise<void> {
 // 直接返回对象会变成 Go 的 map 文本（map[busy:true ...]），后端解析不出来。
 async function onQueryBusy(): Promise<string> {
   try {
-    const reason = playlistManagerMap?.busyReason() ?? '';
+    const reason = aiChat?.busyReason() || dlnaReceiver?.busyReason() || playlistManagerMap?.busyReason() || '';
     return JSON.stringify({ busy: reason !== '', reason });
   } catch (e) {
     // 探测本身出错时按空闲处理，不能因为探测失败就永久阻塞更新
@@ -219,11 +242,17 @@ async function onQueryBusy(): Promise<string> {
 }
 
 async function onHTTPRequest(req: HTTPRequest): Promise<HTTPResponse> {
+  if (req.method !== 'GET' && (req.path.startsWith('/player/') || req.path.startsWith('/mina/') || req.path.startsWith('/dlna/'))) {
+    try { const input = { ...parseQuery(req.query), ...chatBody(req) }; if (typeof input.account_id === 'string' && typeof input.device_id === 'string') voiceDispatcher.invalidateDevice(input.account_id, input.device_id); } catch { }
+  }
+  if (req.path === '/receiver/config' || req.path.startsWith('/dlna/')) return dlnaReceiver.handle(req);
+  if (req.method !== 'GET' && (req.path.startsWith('/groups') || req.path.startsWith('/account') || req.path === '/config' || req.path.includes('/managed'))) { await aiChat.cancelAll(); voiceDispatcher.invalidate(); aiChat.configurationChanged(); }
   return await router.handle(req);
 }
 
 // 入站 WebSocket：播放状态推送订阅（/status/ws）+ 对话记录推送订阅（/conversation/ws）
 async function onWebSocket(req: WebSocketRequest, socket: InboundWebSocket): Promise<void> {
+  if (req.path === WS_CHAT_PATH) { await handleChatWebSocket(req, socket, configManager, aiChat); return; }
   if (req.path === WS_STATUS_PATH) {
     await handleStatusWebSocket(req, socket);
     return;

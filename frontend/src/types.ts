@@ -68,6 +68,7 @@ export interface MiotConfig {
   play_announcement_delay: number;
   play_announcement_scope: string;
   smart_resume_timeout: number;
+  hourly_chime_resume_enabled: boolean;
   default_cover_id: string | number;
   touchscreen_lyrics_enabled: boolean;
   ai_config: AIConfig;
@@ -298,12 +299,12 @@ export interface ScheduledTask {
 }
 
 export interface ScheduleLog {
-  id?: string;
-  task_id?: string;
-  task_name?: string;
-  success?: boolean;
-  message?: string;
-  timestamp?: number | string;
+  task_id: string;
+  task_name: string;
+  action: string;
+  executed_at: string;
+  success: boolean;
+  message: string;
 }
 
 export interface LoginChallenge {

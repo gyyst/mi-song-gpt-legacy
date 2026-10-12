@@ -13,3 +13,7 @@ pnpm-lock.yaml
 
 # Test bundling scratch dir
 .patchtmp/
+
+# 本地升级前备份
+_backup/
+

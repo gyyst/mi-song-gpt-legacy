@@ -10,12 +10,12 @@ import SlIcon from '../ui/SlIcon.vue';
 import SlInput from '../ui/SlInput.vue';
 import SlListView from '../ui/SlListView.vue';
 import SlSelect from '../ui/SlSelect.vue';
+import SlEmptyState from '../ui/SlEmptyState.vue';
 import { openSelect } from '../ui/selectState';
 import { navigation, openPage } from '../runtime';
 import { confirmAction, currentDevice, deviceName, lastPlayedSong, messageOf, playlistLabel, playSong, refreshAll, removeSongFromPlaylist, resumePlaylist, selectPlaylist, state, visibleSongs } from '../store';
 import type { SelectOption, Song } from '../types';
 
-const search = ref('');
 const playlistOptions = computed<SelectOption[]>(() => state.playlists.map((p) => ({ value: String(p.id), label: playlistLabel(p), searchText: p.name })));
 const noServerHint = computed(() => !state.config.server_host || state.config.server_host_status === 'loopback');
 // 有进度记录 + 有设备才给「继续播放」。歌曲列表未必已加载完（歌名靠它取），
@@ -34,13 +34,14 @@ const resumeTitle = computed(() => {
 const listMeasureRetries = 6;
 let listMeasureTimer: ReturnType<typeof setTimeout> | null = null;
 let locateTimer: ReturnType<typeof setTimeout> | null = null;
+let navStyleObserver: MutationObserver | null = null;
 let mounted = false;
 
 // ===== 双向虚拟列表 =====
 //
 // 为什么必须虚拟化（songloft-org/songloft-plugin-miot#96）：以前整份歌单一次性渲染，
 // 1900 首歌就是 1900 个 SongRow 组件、1900 个封面防抖定时器、1900 个排队的封面请求。
-// 原生 `webf-list-view` 的懒构建只省下 Flutter 侧的绘制，这些开销全在 JS 侧照付，
+// 列表容器的懒构建只省下绘制，组件实例与定时器这些开销全在 JS 侧照付，
 // 于是「点定位卡好久 → 封面全空白 → 拖动很卡」：3 个并发封面槽被约 1900 个屏外行占满，
 // 可见行永远排不上队。
 //
@@ -57,14 +58,27 @@ const listRef = ref<InstanceType<typeof SlListView> | null>(null);
 const rowHeight = ref(64);
 /** 列表可视区高度（px），由 measureListHeight 写入。 */
 const listHeight = ref(0);
+/** 浮起胶囊（移动端）压在列表上的高度：固定滚动泥巴值，见 navScrollInset()。 */
+const navInset = ref(0);
 /** 窗口起点的「意向值」，真正生效的是下面 clamp 过的 windowStart。 */
 const rawWindowStart = ref(0);
 /** 供自定义滚动条读取当前滚动位置：由轮询与 @scroll 同步，不依赖组件相互读写 DOM。 */
 const currentScrollTop = ref(0);
 
 const totalSongs = computed(() => visibleSongs.value.length);
+/**
+ * 自定义滚动条是否接管列表滚动。
+ *
+ * 它决定两件事，必须同源：① MiotScrollbar 的 `enabled`（20 首以内原生滚动更自然）；
+ * ② shell 上的 `.miot-scrollbar-active`，只有它为真时才压掉原生滚动条 —— 否则短列表会
+ * 既没有原生条、也没有自定义条，滚动指示整个消失。
+ */
+const scrollbarEnabled = computed(() => totalSongs.value > 20);
 const windowRows = computed(() => {
-  const visible = rowHeight.value > 0 ? Math.ceil(listHeight.value / rowHeight.value) : 0;
+  // 浮起胶囊覆盖在列表底缘之上，真正可用的滚动画布高度要扣掉它，否则窗口
+  // 会比可视区少渲染一行，滚到底时最后一行被胶囊盖住。
+  const usable = Math.max(0, listHeight.value - navInset.value);
+  const visible = rowHeight.value > 0 ? Math.ceil(usable / rowHeight.value) : 0;
   return Math.max(8, visible + WINDOW_BUFFER_ROWS * 2);
 });
 const windowStart = computed(() => {
@@ -79,10 +93,9 @@ const tailSpacerHeight = computed(() => Math.max(0, (totalSongs.value - windowEn
 /**
  * 窗口位置的轮询兜底。
  *
- * 主路径是 `@scroll`，实测在真实 WebF 上是可靠的（`div.sl-list-view-html` 分支）。留这一路
- * 是因为失败代价不对称：事件万一不来，窗口就永不推进、往下滚全是空白，比不虚拟化更糟；
- * 而轮询的代价只是每 120ms 读一次 `scrollTop` 加几步算术。WebF 的 `_dispatchScrollEvent`
- * 只在挂了监听器时才派发，不同客户端版本上的行为不必然一致，所以不赌它。
+ * 主路径是 `@scroll`。留这一路轮询兜底是因为失败代价不对称：事件万一不来，窗口就
+ * 永不推进、往下滚全是空白，比不虚拟化更糟；而轮询的代价只是每 120ms 读一次
+ * `scrollTop` 加几步算术。不同宿主环境上的事件派发行为不必然一致，所以不赌它。
  */
 const WINDOW_POLL_MS = 120;
 let windowPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -105,8 +118,8 @@ function startWindowPoll(): void {
  *
  * 三级取值：真实渲染出来的行 > CSS 变量 > 默认 64。
  * 以真实行优先是因为整套换算的误差会被行号放大——行高差 1px，滚到第 1900 行就偏出约
- * 2000px（三十屏）。而前两级都可能拿不到：WebF 对自定义属性的 getComputedStyle 不保证
- * 有返回值，列表还没渲染时也量不到行。拿不到就退回上一级，绝不会写入 0。
+ * 2000px（三十屏）。而前两级都可能拿不到：getComputedStyle 对自定义属性不保证有
+ * 返回值，列表还没渲染时也量不到行。拿不到就退回上一级，绝不会写入 0。
  */
 function calibrateRowHeight(): void {
   const row = document.querySelector<HTMLElement>('.song-row');
@@ -139,7 +152,8 @@ function calibrateRowHeight(): void {
  */
 function syncWindowToScroll(top: number): void {
   const firstVisible = Math.max(0, Math.floor(top / rowHeight.value));
-  const lastVisible = Math.min(totalSongs.value, Math.ceil((top + listHeight.value) / rowHeight.value));
+  const usable = Math.max(0, listHeight.value - navInset.value);
+  const lastVisible = Math.min(totalSongs.value, Math.ceil((top + usable) / rowHeight.value));
   const desired = Math.max(0, firstVisible - WINDOW_BUFFER_ROWS);
   const uncovered = windowStart.value > firstVisible || windowEnd.value < lastVisible;
   if (uncovered || Math.abs(desired - rawWindowStart.value) >= WINDOW_STEP_ROWS) rawWindowStart.value = desired;
@@ -163,9 +177,9 @@ function resetSongWindow(): void {
 /**
  * 拖动/点按自定义滚动条时的落点。fraction 是 [0, 1] 的目标滚动位置比例。
  *
- * 与 scrollToIndex 的路子一致：先按目标位置推进窗口再写 scrollTop，否则 WebF 的
- * ListView.builder 会因目标区域尚未布局把 maxScrollExtent 钳掉，写入被截断。这里
- * 还额外设置 locateGuardUntilMs，防止 120ms 轮询把窗口拽回旧位置。
+ * 与 scrollToIndex 的路子一致：先按目标位置推进窗口再写 scrollTop，否则目标区域
+ * 尚未布局时滚动范围未撑开、写入会被截断。这里还额外设置 locateGuardUntilMs，
+ * 防止 120ms 轮询把窗口拽回旧位置。
  */
 function seekToFraction(fraction: number): void {
   if (!mounted) return;
@@ -174,8 +188,10 @@ function seekToFraction(fraction: number): void {
   const total = totalSongs.value;
   if (total <= 0 || rowHeight.value <= 0) return;
   const clamped = Math.max(0, Math.min(1, fraction));
+  // 列表底部给浮起胶囊留了 padding-bottom（= navInset），这段也要算进滚动范围：
+  // 否则自定义滚动条拖到底时，最后一行正好停在胶囊底缘之下。
   const totalHeight = total * rowHeight.value;
-  const maxTop = Math.max(0, totalHeight - listHeight.value);
+  const maxTop = Math.max(0, totalHeight + navInset.value - listHeight.value);
   const target = maxTop * clamped;
   rawWindowStart.value = Math.max(0, Math.floor(target / rowHeight.value) - WINDOW_BUFFER_ROWS);
   locateGuardUntilMs = Date.now() + 400;
@@ -183,29 +199,55 @@ function seekToFraction(fraction: number): void {
   void nextTick(() => list.setScrollTop(target));
 }
 
+/**
+ * 当前导航形态下，浮起胶囊压在列表底缘之上的高度（CSS 像素）。
+ * - 标准档：贴底播放条不遮挡列表（.miot-page-with-player 已把 padding-bottom 归零），返回 0。
+ * - 胶囊档：列表一直铺到视口底，最后一段被浮起胶囊盖住，靠 .sl-list-view 的
+ *   padding-bottom 把内容垫起来。留白按 主程序 navScrollInset 取证：
+ *   手机 bottom(8) + height(59) + 16 呼吸 = 83；平板/桌面 12 + 64 + 8 = 84。
+ */
+function navScrollInset(): number {
+  if (document.documentElement.getAttribute('data-navigation-style') !== 'capsule') return 0;
+  const capsuleCompact = window.innerWidth < 600;
+  return capsuleCompact ? 83 : 84;
+}
+
+/**
+ * 量列表可视区高度并同步虚拟窗口状态。
+ *
+ * 标准档量到播放条顶（fixed 贴底，.miot-page-with-player 已把 padding-bottom 归零）；
+ * 胶囊档浮起，getBoundingClientRect().top 量出来的是被遮挡的位置，列表必须一直铺到
+ * 视口底，再用 padding-bottom 垫出胶囊的高度（旧写法量到 741px 处，比正确的列表底
+ * 短了 59px，于是最后一行滚不到、正好卡在胶囊底下）。
+ */
 function measureListHeight(attempt = 0): void {
   if (!mounted) return;
   const list = document.querySelector<HTMLElement>('.sl-list-view');
   const player = document.querySelector<HTMLElement>('.player-bar-shell');
   const listTop = list?.getBoundingClientRect().top || 0;
-  // 有播放条：列表填到播放条顶（它 fixed 在底部，`.miot-page-with-player` 已把
-  // padding-bottom 归零）。无播放条：列表只能填到「视口底 − .miot-page 的
-  // padding-bottom」—— 这段内边距是给 fixed 播放条预留的、无条件存在（移动端 90px）。
-  // 旧写法恒用 innerHeight - 16 没算它，列表越过内容区底端把页面撑出约 74px，
-  // 哪怕只有 1 首歌页面也出滚动条（songloft-org/songloft#410 后续报告）。
+  const capsule = document.documentElement.getAttribute('data-navigation-style') === 'capsule';
+  const inset = navScrollInset();
+  navInset.value = inset;
+
   let listBottom: number;
-  if (player) {
+  if (player && !capsule) {
     listBottom = player.getBoundingClientRect().top;
   } else {
-    const page = list?.closest('.miot-page');
-    const padBottom = page ? parseFloat(getComputedStyle(page).paddingBottom) || 0 : 0;
+    // 无播放条 / 胶囊档：填到视口底。标准档无播放条时要扣掉 .miot-page 为
+    // fixed 播放条预留的 padding-bottom，否则只有 1 首歌页面也会被撑出滚动条。
+    let padBottom = 0;
+    if (!player && !capsule) {
+      const page = list?.closest('.miot-page');
+      padBottom = page ? parseFloat(getComputedStyle(page).paddingBottom) || 0 : 0;
+    }
     listBottom = window.innerHeight - padBottom;
   }
+
+  if (list) list.style.paddingBottom = inset > 0 ? `${inset}px` : '';
+
   if (list && listTop > 0 && listBottom > listTop) {
     const height = Math.max(128, Math.round(listBottom - listTop));
     list.style.height = `${height}px`;
-    // 窗口大小按可视区行数算，所以量到高度后要同步给虚拟列表。
-    // 行也已经布局完了，顺便校准行高（这条重试阶梯本来就是等 WebF 布局的）。
     listHeight.value = height;
     calibrateRowHeight();
     return;
@@ -253,11 +295,11 @@ function notifyLocal(error: unknown) { console.warn('[miot] play failed', messag
  * 滚到指定行并居中。
  *
  * 行是定高的，所以目标位置就是 `index × 行高`，不再需要旧写法那套
- * 「等新行布局完 → 量 getBoundingClientRect → 相对位移」——那套在 WebF 上要跟异步布局
- * 赛跑，量到零尺寸就把 scrollTop 冲成 0（表现为"定位跳回第一屏"）。
+ * 「等新行布局完 → 量 getBoundingClientRect → 相对位移」——那套要跟异步布局赛跑，
+ * 量到零尺寸就把 scrollTop 冲成 0（表现为"定位跳回第一屏"）。
  *
- * 仍要重试，但重试的判据变成「写进去的 scrollTop 生效了没有」：WebF 的滚动范围要等
- * Flutter 侧布局完占位条才成立，在那之前写入会被钳掉。
+ * 仍要重试，但重试的判据变成「写进去的 scrollTop 生效了没有」：滚动范围要等
+ * 布局完占位条才成立，在那之前写入会被钳掉。
  */
 function scrollToIndex(index: number, attempt = 0): void {
   if (!mounted) return;
@@ -297,12 +339,18 @@ onMounted(() => {
   mounted = true;
   calibrateRowHeight();
   window.addEventListener('resize', remeasureList);
+  if (typeof MutationObserver !== 'undefined') {
+    navStyleObserver = new MutationObserver(remeasureList);
+    navStyleObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-navigation-style'] });
+  }
   remeasureList();
   startWindowPoll();
 });
 onUnmounted(() => {
   mounted = false;
   window.removeEventListener('resize', remeasureList);
+  navStyleObserver?.disconnect();
+  navStyleObserver = null;
   if (listMeasureTimer) clearTimeout(listMeasureTimer);
   if (locateTimer) clearTimeout(locateTimer);
   if (windowPollTimer) {
@@ -335,7 +383,7 @@ onUnmounted(() => {
 
     <div class="player-toolbar">
       <div class="toolbar-field">
-        <SlSelect :model-value="state.selectedPlaylistId" :options="playlistOptions" placeholder="选择歌单" allow-empty searchable search-placeholder="搜索歌单" aria-label="选择歌单" @update:model-value="onPlaylist" />
+        <SlSelect leading-icon="queue_music" :model-value="state.selectedPlaylistId" :options="playlistOptions" placeholder="选择播放歌单" allow-empty searchable search-placeholder="搜索歌单" aria-label="选择歌单" @update:model-value="onPlaylist" />
       </div>
       <!-- 有上次播放记录才出现：从这个歌单自己的进度接着播，不受中间切过别的歌单影响 -->
       <SlButton
@@ -351,35 +399,52 @@ onUnmounted(() => {
 
     <div v-if="state.selectedPlaylistId" class="search-bar">
       <SlIcon name="search" :size="20" />
-      <SlInput :model-value="search" aria-label="搜索歌曲" placeholder="搜索歌曲、艺术家或专辑" @update:model-value="(v) => { search = v; state.songSearch = v; }" />
-      <SlButton v-if="search" variant="icon" icon="close" title="清除搜索" @click="search = ''; state.songSearch = ''" />
+      <SlInput :model-value="state.songSearch" aria-label="搜索歌曲" placeholder="搜索歌曲、艺术家或专辑" @update:model-value="(v) => { state.songSearch = v; }" />
+      <SlButton v-if="state.songSearch" variant="icon" icon="close" title="清除搜索" @click="state.songSearch = ''" />
       <SlButton variant="icon" icon="my_location" title="定位当前播放" @click="locateCurrentSong" />
     </div>
 
     <!-- 虚拟列表：两个占位条常驻（高度为 0 时也不摘掉），保持列表子节点结构稳定，
          避免窗口滑动时原生 ListView 的子节点索引整体错位。
-         外层 miot-scrollbar-shell 是 position: relative，让自定义可拖动滚动条能覆盖在右侧。 -->
-    <div v-if="state.selectedPlaylistId && !state.songsLoading && !state.songsError" class="miot-scrollbar-shell">
-      <SlListView ref="listRef" aria-label="歌曲列表" @scroll="onListScroll">
-        <div class="song-list-spacer" :style="{ height: `${leadSpacerHeight}px` }"></div>
-        <SongRow v-for="(song, index) in renderedSongs" :key="song.id" :song="song" :index="windowStart + index" :removable="songRemovable" @play="play" @remove="removeSong" />
-        <div class="song-list-spacer" :style="{ height: `${tailSpacerHeight}px` }"></div>
-        <div v-if="totalSongs === 0" class="song-list-empty">没有匹配的歌曲</div>
-      </SlListView>
-      <!-- 20 首以内没必要出滚动条，短列表用原生滚动更自然 -->
-      <MiotScrollbar
-        :total-items="totalSongs"
-        :row-height="rowHeight"
-        :viewport-height="listHeight"
-        :scroll-top="currentScrollTop"
-        :enabled="totalSongs > 20"
-        :label-builder="(i, t) => `${i} / ${t}`"
-        @seek="seekToFraction"
-      />
+         miot-scrollbar-shell 是滚动条 overlay 的定位基准（position: relative）。
+         表头必须留在它外面：表头也算进 shell 高度时，轨道从表头顶端起算、拇指
+         滑到底仍差一个表头高度到不了底，顶部则会顶进表头（见 MiotScrollbar 注释）。
+         miot-scrollbar-active 只在自定义滚动条真的接管时挂上，用来压掉原生滚动条。 -->
+    <div v-if="state.selectedPlaylistId && !state.songsLoading && !state.songsError" class="song-list">
+      <div class="song-list-header" aria-hidden="true">
+        <span class="song-header-index">#</span>
+        <span class="song-header-cover"></span>
+        <span class="song-header-title">标题</span>
+        <span class="song-header-artist">艺术家</span>
+        <span class="song-header-album">专辑</span>
+        <span class="song-header-duration">时长</span>
+        <span class="song-header-actions"></span>
+      </div>
+      <div class="miot-scrollbar-shell" :class="{ 'miot-scrollbar-active': scrollbarEnabled }">
+        <SlListView ref="listRef" aria-label="歌曲列表" @scroll="onListScroll">
+          <div class="song-list-spacer" :style="{ height: `${leadSpacerHeight}px` }"></div>
+          <SongRow v-for="(song, index) in renderedSongs" :key="song.id" :song="song" :index="windowStart + index" :removable="songRemovable" @play="play" @remove="removeSong" />
+          <div class="song-list-spacer" :style="{ height: `${tailSpacerHeight}px` }"></div>
+          <div v-if="totalSongs === 0" class="song-list-empty">没有匹配的歌曲</div>
+        </SlListView>
+        <!-- 20 首以内没必要出滚动条，短列表用原生滚动更自然 -->
+        <MiotScrollbar
+          :total-items="totalSongs"
+          :row-height="rowHeight"
+          :viewport-height="Math.max(0, listHeight - navInset)"
+          :bottom-inset="navInset"
+          :scroll-top="currentScrollTop"
+          :enabled="scrollbarEnabled"
+          :label-builder="(i, t) => `${i} / ${t}`"
+          @seek="seekToFraction"
+        />
+      </div>
     </div>
     <div v-else-if="state.songsLoading" class="song-list-empty"><span class="loading-spinner"></span><span>正在加载歌曲</span></div>
-    <div v-else-if="state.songsError" class="song-list-empty"><span>{{ state.songsError }}</span><SlButton variant="text" label="重试" @click="selectPlaylist(state.selectedPlaylistId)" /></div>
-    <div v-else class="song-list-empty"><div><SlIcon name="queue_music" :size="34" /><p>选择歌单后开始播放</p></div></div>
+    <SlEmptyState v-else-if="state.songsError" title="歌曲加载失败" :description="state.songsError" icon="cloud_off">
+      <SlButton variant="tonal" label="重新加载" icon="refresh" @click="selectPlaylist(state.selectedPlaylistId)" />
+    </SlEmptyState>
+    <SlEmptyState v-else title="选择一个歌单" description="选好歌单后，可以搜索、定位并直接推送到音箱播放。" icon="queue_music" />
 
     <PlayerBar />
 

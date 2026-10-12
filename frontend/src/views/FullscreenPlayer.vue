@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch, type CSSProperties } from 'vue';
 import { useSongCover } from '../covers';
+import { extractCoverPalette, paletteFromMetadata, paletteStyle } from '../playerPalette';
 import PlayerModePopup from './PlayerModePopup.vue';
 import PlayerSpeedPopup from './PlayerSpeedPopup.vue';
 import PlayerProgress from './PlayerProgress.vue';
@@ -21,7 +22,7 @@ const favoriteBusy = ref(false);
 const sleepTimerBusy = ref(false);
 const sleepTimer = ref<SleepTimerStatus>({ active: false, mode: 'time', remaining: 0, total: 0 });
 const mobilePager = ref<HTMLElement | null>(null);
-const mobilePage = ref(0);
+const mobilePage = computed(() => navigation.playerPage);
 const desktopLyrics = ref<HTMLElement | null>(null);
 const mobileLyrics = ref<HTMLElement | null>(null);
 let touchStartX = 0;
@@ -38,12 +39,30 @@ const activeLyric = computed(() => {
 // 桌面与移动 stage **同时**在 DOM 里（只靠媒体查询 `display:none` 切换），所以这里
 // 刻意开两份、并用不同的 `w=`：
 //   ① 尺寸本来就不同（桌面 frame 360px、移动 72vw/max 320px），各取 2x 更合理；
-//   ② 更要紧的是别让两个 `<img>` 落到同一个 URL 上 —— WebF 的 `_loadNormalImage`
-//      会 `evict(BoxFitImageKey(url, ImageConfiguration.empty), includeLive: true)`
-//      紧接着又用同一个 key 去 resolve，同 URL 的两个 img 会互相把对方（连同已解码的
-//      `ui.Image`）毙掉，表现是空白且**不发 error 事件**（#86 的可疑主因之一）。
+//   ② 更要紧的是别让两个 `<img>` 落到同一个 URL 上 —— 同 URL 的两个 img 共享
+//      同一份缓存键，一方的失败/驱逐会连带毙掉另一方，排查也难（#86 的教训）。
 const { src: cover, epoch: coverEpoch, onError: onCoverError, onLoad: onCoverLoad } = useSongCover(() => state.player.current_song, 768);
 const { src: coverMobile, epoch: coverMobileEpoch, onError: onCoverMobileError, onLoad: onCoverMobileLoad } = useSongCover(() => state.player.current_song, 640);
+const backgroundStyle = ref<CSSProperties>({});
+let paletteGeneration = 0;
+
+/**
+ * 先立即应用歌曲元数据生成的稳定配色，再异步替换成封面提取色。
+ * generation 防止快速切歌时较慢的旧封面覆盖当前歌曲背景。
+ */
+async function refreshBackgroundPalette(): Promise<void> {
+  const generation = ++paletteGeneration;
+  const song = state.player.current_song;
+  const fallback = paletteFromMetadata(song);
+  backgroundStyle.value = paletteStyle(fallback);
+  if (!song) return;
+
+  const url = cover.value || coverMobile.value;
+  if (!url) return;
+  const extracted = await extractCoverPalette(url);
+  if (generation !== paletteGeneration || state.player.current_song?.id !== song.id) return;
+  if (extracted) backgroundStyle.value = paletteStyle(extracted);
+}
 
 function parseLrc(text: string): LyricLine[] {
   const output: LyricLine[] = [];
@@ -226,7 +245,7 @@ function syncMobilePage(): void {
     const currentPager = mobilePager.value;
     if (!currentPager || currentPager.clientWidth <= 0) return;
     mobileSettledPage = page;
-    mobilePage.value = page;
+    navigation.playerPage = page;
     const target = currentPager.clientWidth * page;
     if (Math.abs(currentPager.scrollLeft - target) > 1) currentPager.scrollLeft = target;
   }, 120);
@@ -235,7 +254,7 @@ function syncMobilePage(): void {
 function showMobilePage(index: number): void {
   const pager = mobilePager.value;
   mobileSettledPage = index;
-  mobilePage.value = index;
+  navigation.playerPage = index;
   if (!pager) return;
   window.clearTimeout(mobileScrollTimer);
   pager.scrollLeft = pager.clientWidth * index;
@@ -281,17 +300,30 @@ onMounted(() => {
   void loadSongDetails();
   void loadSleepTimer();
 });
-onUnmounted(() => window.clearTimeout(mobileScrollTimer));
+onUnmounted(() => {
+  paletteGeneration += 1;
+  window.clearTimeout(mobileScrollTimer);
+});
 watch(() => state.player.current_song?.id, loadSongDetails);
+watch([() => state.player.current_song?.id, cover, coverMobile], refreshBackgroundPalette, { immediate: true });
 watch(() => [state.currentAccountId, state.currentDeviceId], loadSleepTimer);
 watch(activeLyric, centerActiveLyric);
+watch(() => navigation.playerPage, showMobilePage);
 </script>
 
 <template>
-  <div class="fullscreen-player page-view">
-    <div class="fullscreen-close-button">
-      <SlButton variant="icon" icon="keyboard_arrow_down" class="player-tool-button" title="收起播放器" @click="close" />
+  <div class="fullscreen-player page-view" :style="backgroundStyle">
+    <div class="fullscreen-ambient" aria-hidden="true">
+      <img v-if="cover || coverMobile" class="fullscreen-ambient-cover" :src="cover || coverMobile" alt="" />
+      <div class="fullscreen-ambient-tint"></div>
+      <div class="fullscreen-ambient-glow"></div>
+      <div class="fullscreen-theme-gradient"></div>
     </div>
+    <header class="fullscreen-topbar">
+      <SlButton variant="icon" icon="keyboard_arrow_down" class="fullscreen-collapse-button" title="收起播放器" @click="close" />
+      <span class="fullscreen-topbar-title">正在播放</span>
+      <span class="fullscreen-topbar-spacer" aria-hidden="true"></span>
+    </header>
     <main class="fullscreen-inner">
       <div class="fullscreen-layout">
         <div class="fullscreen-stage">
@@ -304,6 +336,7 @@ watch(activeLyric, centerActiveLyric);
               <div class="fullscreen-song-meta fullscreen-song-meta-desktop">
                 <span class="fullscreen-song-title">{{ state.player.current_song?.title || '暂无播放' }}</span>
                 <span class="fullscreen-song-artist">{{ state.player.current_song?.artist || '选择一首歌曲开始播放' }}</span>
+                <span v-if="state.player.current_song?.album" class="fullscreen-song-album">{{ state.player.current_song.album }}</span>
               </div>
             </section>
             <section ref="desktopLyrics" class="lyrics fullscreen-lyrics-panel" aria-label="歌词">
@@ -338,6 +371,7 @@ watch(activeLyric, centerActiveLyric);
             <div class="fullscreen-page-indicator" aria-label="播放器页面">
               <button type="button" :class="{ active: mobilePage === 0 }" aria-label="显示封面" @click="showMobilePage(0)"></button>
               <button type="button" :class="{ active: mobilePage === 1 }" aria-label="显示歌词" @click="showMobilePage(1)"></button>
+              <span class="fullscreen-swipe-hint">{{ mobilePage === 0 ? '左滑看歌词' : '右滑看封面' }}</span>
             </div>
           </div>
         </div>
@@ -444,8 +478,8 @@ watch(activeLyric, centerActiveLyric);
                  只含播放器语义图标（play/pause/skip/volume/…），不含 delete 字形；
                  强行用会 fallback 成字面文本渲染不出图标。走 Miot UI Icons 的 delete
                  (0xE92E)，与 SongRow 的删除按钮字形一致。 -->
-            <SlButton variant="icon" icon="delete" class="player-tool-button" title="从歌单删除" :disabled="!canRemoveCurrent" @click="removeCurrentSong" />
-            <SlButton variant="icon" icon="stop" player-icon class="player-tool-button" title="停止播放" :disabled="state.playerBusy" @click="playerCommand('/player/stop')" />
+            <SlButton variant="icon" icon="delete" class="player-tool-button player-tool-danger" title="从歌单删除" :disabled="!canRemoveCurrent" @click="removeCurrentSong" />
+            <SlButton variant="icon" icon="stop" player-icon class="player-tool-button player-tool-stop" title="停止播放" :disabled="state.playerBusy" @click="playerCommand('/player/stop')" />
           </div>
         </div>
       </div>

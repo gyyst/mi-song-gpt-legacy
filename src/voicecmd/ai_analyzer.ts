@@ -4,7 +4,21 @@
 /// <reference types="@songloft/plugin-sdk" />
 
 import type { AIConfig, AIAnalysisResult } from '../types';
-import { aiChatCompletionsUrl, maskUrl } from '../utils/ai_url';
+import { aiChatCompletionsUrl } from '../utils/ai_url';
+import { requestAI } from '../utils/ai_request';
+
+/** 仅百炼官方端点的已知混合思考模型使用非标准参数，避免影响其它兼容接口。 */
+function canDisableDashScopeThinking(endpoint: string, model: string): boolean {
+  const isDashScope = /^https?:\/\/(?:dashscope(?:-intl|-us)?\.aliyuncs\.com|[a-z0-9.-]+\.maas\.aliyuncs\.com)(?::\d+)?\//i.test(endpoint);
+  const hybridModel = /^qwen3\.[5-8]-(?:plus|flash)(?:-latest|-\d{4}-\d{2}-\d{2})?$/i.test(model);
+  const legacyHybrid = /^qwen-(plus|flash)(?:-(latest|\d{4}-\d{2}-\d{2}))?$/i.exec(model);
+  const legacySupported = legacyHybrid !== null && (
+    !legacyHybrid[2] || legacyHybrid[2].toLowerCase() === 'latest' ||
+    legacyHybrid[2] >= (legacyHybrid[1].toLowerCase() === 'plus' ? '2025-04-28' : '2025-07-28')
+  );
+  const hybridMaxModels = ['qwen3.8-max', 'qwen3.7-max', 'qwen3.7-max-2026-05-20', 'qwen3.7-max-2026-06-08'];
+  return isDashScope && (hybridModel || legacySupported || hybridMaxModels.includes(model.toLowerCase()));
+}
 
 /** AI System Prompt */
 const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，只返回JSON：{"action":"...","params":{...},"confidence":"high|medium|low"}
@@ -52,19 +66,21 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，只返回
  * 调用 LLM API 分析用户语音指令，提取操作类型和参数
  */
 export class AIAnalyzer {
+  constructor(private schedule?: (run: () => Promise<AIAnalysisResult>, current: () => boolean, scope: string) => Promise<AIAnalysisResult>) { }
   /**
    * 调用 AI 分析用户语音指令（静默模式，失败返回 null）
    * @param query 用户语音文本
    * @param config AI 配置
    * @returns 分析结果，超时或失败返回 null
    */
-  async analyze(query: string, config: AIConfig): Promise<AIAnalysisResult | null> {
+  async analyze(query: string, config: AIConfig, current = () => true, scope = ''): Promise<AIAnalysisResult | null> {
     if (!config.enabled || !config.api_url || !config.api_key) {
       return null;
     }
 
     try {
-      return await this.callAI(query, config);
+      const run = () => this.callAI(query, config);
+      return this.schedule ? await this.schedule(run, current, scope) : await run();
     } catch (e) {
       songloft.log.warn(`[AIAnalyzer] AI analysis failed: ${String(e)}`);
       return null;
@@ -91,19 +107,16 @@ export class AIAnalyzer {
   private async callAI(query: string, config: AIConfig): Promise<AIAnalysisResult> {
     // 与模型列表端点共用同一套 /v1 归一化规则，避免两处对 api_url 的假设不一致
     const endpoint = aiChatCompletionsUrl(config.api_url);
-    songloft.log.info(`[AIAnalyzer] Calling ${maskUrl(endpoint)} model=${config.model} timeout=${config.timeout}s`);
 
     const messages = [
       { role: 'system', content: AI_SYSTEM_PROMPT },
       { role: 'user', content: `用户指令：${query}` },
     ];
 
+    // 省略 token 上限和采样温度，由服务端使用默认值，兼容推理模型及各类代理。
     const body: Record<string, unknown> = {
       model: config.model,
       messages,
-      // 分类任务低温保证输出稳定（1.0 会导致小模型在置信度/动作间乱跳）
-      temperature: 0.2,
-      max_tokens: 120,
       response_format: { type: 'json_object' },
     };
     // reasoning_split 仅硅基流动（SiliconFlow）原生支持，用于分离推理链使 content 直接是干净 JSON；
@@ -112,44 +125,41 @@ export class AIAnalyzer {
       body.extra_body = { reasoning_split: true };
     }
 
-    const fetchPromise = fetch(endpoint, {
+    // 直接 fetch 的扩展参数必须放在 JSON 顶层；extra_body 是 Python SDK 的透传选项。
+    // 口令提取不需要思考链，Qwen3.7-Flash 等默认思考会耗尽短超时预算（#122）。
+    const thinkingDisabled = canDisableDashScopeThinking(endpoint, config.model);
+    if (thinkingDisabled) body.enable_thinking = false;
+
+    return requestAI(endpoint, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${config.api_key}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
+    }, config.timeout, { kind: 'analysis', model: config.model, thinkingDisabled, queryChars: query.length }, async (resp, requestId) => {
+      if (!resp.ok) {
+        throw new Error(`API error: ${resp.status} ${await resp.text()}`);
+      }
+
+      const data = await resp.json();
+      const message = data.choices?.[0]?.message;
+      const content = message?.content as string | undefined;
+      const finishReason = data.choices?.[0]?.finish_reason as string | undefined;
+      const usage = data.usage;
+      songloft.log.info(`[AIAnalyzer] id=${requestId} finish_reason=${finishReason ?? 'unavailable'} content_chars=${content?.length ?? 0} reasoning_chars=${message?.reasoning_content?.length ?? 0} prompt_tokens=${usage?.prompt_tokens ?? 'unavailable'} completion_tokens=${usage?.completion_tokens ?? 'unavailable'} reasoning_tokens=${usage?.completion_tokens_details?.reasoning_tokens ?? 'unavailable'}`);
+      if (!content) {
+        throw new Error('Empty response from AI API');
+      }
+
+      if (finishReason && finishReason !== 'stop') {
+        songloft.log.warn(`[AIAnalyzer] id=${requestId} content may be truncated`);
+      }
+
+      const result = this.parseResponse(content);
+      songloft.log.info(`[AIAnalyzer] id=${requestId} parsed=true confidence=${result.confidence}`);
+      return result;
     });
-
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('AI API call timed out')), config.timeout * 1000);
-    });
-
-    let resp: Response;
-    try {
-      resp = await Promise.race([fetchPromise, timeoutPromise]);
-    } catch (e) {
-      songloft.log.warn(`[AIAnalyzer] fetch error: ${String(e)}`);
-      throw e;
-    }
-
-    if (!resp.ok) {
-      throw new Error(`API error: ${resp.status} ${await resp.text()}`);
-    }
-
-    const data = await resp.json();
-    const content = data.choices?.[0]?.message?.content as string | undefined;
-    const finishReason = data.choices?.[0]?.finish_reason as string | undefined;
-    if (!content) {
-      throw new Error('Empty response from AI API');
-    }
-
-    if (finishReason && finishReason !== 'stop') {
-      songloft.log.warn(`[AIAnalyzer] Finish reason: ${finishReason} (content may be truncated)`);
-    }
-
-    songloft.log.info(`[AIAnalyzer] API response: ${content.slice(0, 200)}`);
-    return this.parseResponse(content);
   }
 
   /**
@@ -172,7 +182,7 @@ export class AIAnalyzer {
         rawText: parsed.rawText || '',
       };
     } catch {
-      songloft.log.warn(`[AIAnalyzer] Direct JSON parse failed, content: ${content.slice(0, 300)}`);
+      songloft.log.warn(`[AIAnalyzer] Direct JSON parse failed, content_chars=${content.length}; trying fallback`);
     }
 
     // 兜底：去掉思考标签后再提取 JSON
@@ -204,8 +214,8 @@ export class AIAnalyzer {
     }
 
     if (!parsed || typeof parsed !== 'object') {
-      songloft.log.warn(`[AIAnalyzer] Fallback JSON parse also failed, extracted: ${jsonStr.slice(0, 300)}`);
-      throw new Error(`Failed to parse AI response: ${jsonStr.slice(0, 100)}`);
+      songloft.log.warn(`[AIAnalyzer] Fallback JSON parse also failed, extracted_chars=${jsonStr.length}`);
+      throw new Error('Failed to parse AI response');
     }
 
     return {

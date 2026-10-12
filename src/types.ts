@@ -190,6 +190,7 @@ export interface PluginConfig {
   conversation_poll_interval: number;
   debug_log_enabled?: boolean; // 调试日志开关，默认 false（覆盖会话轮询与音箱推流诊断日志）
   smart_resume_timeout: number;
+  hourly_chime_resume_enabled?: boolean; // 整点报时后续播，默认关闭
   max_song_index: number;
   ai_config: AIConfig;
   qa_config: QAConfig;   // 问答接管配置（mi-song-gpt 新增，独立存储键 qa_config）

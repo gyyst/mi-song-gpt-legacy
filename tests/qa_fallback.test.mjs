@@ -1,11 +1,34 @@
 import assert from 'node:assert/strict';
-import { isXiaoAIAnswerFailure, QAFallback } from '../src/voicecmd/qa_fallback.ts';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const ts = require('typescript');
+
+// 与其它测试一致：转译成 CJS 再注入依赖（qa_fallback → ai_url 无扩展名，Node ESM 解析不了）
+function loadTs(file, mocks = {}) {
+  const source = readFileSync(new URL(file, import.meta.url), 'utf8');
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+  });
+  const module = { exports: {} };
+  new Function('require', 'exports', outputText)(name => {
+    if (Object.hasOwn(mocks, name)) return mocks[name];
+    throw new Error('unexpected dependency: ' + name);
+  }, module.exports);
+  return module.exports;
+}
 
 // Global songloft stub for logging in tests
 globalThis.songloft = {
   log: { info: () => {}, warn: () => {}, error: () => {} },
   storage: { get: async () => null, set: async () => {} },
 };
+
+const aiUrl = loadTs('../src/utils/ai_url.ts');
+const { isXiaoAIAnswerFailure, QAFallback } = loadTs('../src/voicecmd/qa_fallback.ts', {
+  '../utils/ai_url': aiUrl,
+});
 
 // ===== isXiaoAIAnswerFailure：小爱兜底话术 =====
 

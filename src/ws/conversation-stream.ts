@@ -38,6 +38,16 @@ export function initConversationStream(cm: ConversationMonitor): void {
   conversationMonitor = cm;
 }
 
+/**
+ * 语音引擎处理完成后（msg.outcome 已回填）补推一帧。
+ * dispatcher 是异步派发，monitor 的增量帧先于 outcome 到达前端；
+ * 这里在 outcome 落定后再推一帧同形状的 message 帧，前端按 id upsert（mi-song-gpt）。
+ */
+export function notifyConversationOutcome(msg: ConversationMessage): void {
+  if (sockets.size === 0) return;
+  broadcast({ type: 'message', data: toConversationViewModel(msg) });
+}
+
 /** 向所有在线订阅者广播一帧 */
 function broadcast(frame: Record<string, any>): void {
   if (sockets.size === 0) return;

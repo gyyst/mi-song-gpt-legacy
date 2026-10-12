@@ -7,8 +7,9 @@ import SlIcon from '../../ui/SlIcon.vue';
 import SlInput from '../../ui/SlInput.vue';
 import SlSelect from '../../ui/SlSelect.vue';
 import SlSwitch from '../../ui/SlSwitch.vue';
+import VoiceSectionNav from './voice/VoiceSectionNav.vue';
 import { del, post, postLong, pluginWebSocketUrl } from '../../api';
-import { AI_PRESET_PROVIDERS } from '../../aiPresets';
+import { navigation } from '../../runtime';
 import {
   addWebhook,
   clearMemory,
@@ -18,17 +19,28 @@ import {
   loadMemory,
   loadSearchProviders,
   loadVoiceData,
-  loadAiModels,
   managedDevices,
   messageOf,
   notify,
   playlistLabel,
   refreshIndex,
+  sortConversationDesc,
+  upsertConversationMessage,
   saveConfig,
   saveVoiceCommands,
   state,
 } from '../../store';
 import type { ConversationMessage, MemoryEntity, SearchSource, SelectOption, VoiceCommand } from '../../types';
+
+const voicePanel = ref<VoicePanel>('listen');
+const voicePanels: Array<{ id: VoicePanel; title: string; subtitle: string; icon: string }> = [
+  { id: 'listen', title: '监听', subtitle: '对话与索引', icon: 'record_voice_over' },
+  { id: 'commands', title: '口令', subtitle: '规则与测试', icon: 'mic' },
+  { id: 'memory', title: '记忆', subtitle: '命中与歧义', icon: 'memory' },
+  { id: 'intelligence', title: '搜索', subtitle: '外部搜索源', icon: 'auto_awesome' },
+];
+
+type VoicePanel = 'listen' | 'commands' | 'memory' | 'intelligence';
 
 interface CommandTestResult {
   matched: boolean;
@@ -123,9 +135,6 @@ const commandTestQuery = ref('');
 const commandTestResult = ref('');
 const commandTestSuccess = ref(false);
 const commandTestBusy = ref(false);
-const aiTestQuery = ref('');
-const aiTestResult = ref('');
-const aiTestBusy = ref(false);
 const sourceTestQuery = ref('');
 const sourceTestResult = ref('');
 const selectedProviderId = ref('');
@@ -139,38 +148,8 @@ const memoryExpanded = ref(false);
 const memoryLoaded = ref(false);
 const memoryLoading = ref(false);
 const expandedMemory = ref<string | null>(null);
-const aiModelsList = ref<{ id: string; ownedBy?: string }[]>([]);
-const aiModelLoading = ref(false);
-const aiModelError = ref('');
-// 连接状态与延迟：idle=未配置/未检测，loading=检测中，ok=已连接，error=失败
-const aiConnState = ref<'idle' | 'loading' | 'ok' | 'error'>('idle');
-const aiConnLatency = ref<number | null>(null);
 let conversationSocket: WebSocket | null = null;
 let conversationPoll: ReturnType<typeof setInterval> | null = null;
-
-// --- AI 预设服务商（国内免费/便宜优先） ---
-const aiPresetOptions = [
-  { value: 'custom', label: '自定义（OpenAI 兼容）', searchText: '自定义 openai 兼容' },
-  ...AI_PRESET_PROVIDERS.map((p) => ({ value: p.id, label: p.name, searchText: p.name })),
-];
-const selectedAiPreset = ref('custom');
-const selectedAiPresetObj = computed(() => AI_PRESET_PROVIDERS.find((p) => p.id === selectedAiPreset.value) || null);
-
-/** 选中预设即自动填 API 地址与默认模型（不碰 API Key）；选「自定义」则展示地址输入框供手填 */
-async function applyAiPreset(id: string): Promise<void> {
-  selectedAiPreset.value = id;
-  if (id === 'custom') {
-    notify('已选择自定义，请填写 API 地址与模型', 'success');
-    return; // 自定义：保留用户已填的 url/model，仅展示输入框
-  }
-  const p = AI_PRESET_PROVIDERS.find((x) => x.id === id);
-  if (!p) return;
-  state.config.ai_config.api_url = p.baseUrl;
-  if (p.defaultModel) state.config.ai_config.model = p.defaultModel;
-  modelCustomActive.value = false; // 预设自带模型即视为非自定义
-  await saveConfig({ ai_config: state.config.ai_config });
-  notify(`已套用预设「${p.name}」，请填写 API Key`, 'success');
-}
 
 function syncSourceDrafts(): void {
   for (const source of Array.isArray(state.config.external_search_sources) ? state.config.external_search_sources : []) {
@@ -238,19 +217,7 @@ syncSourceDrafts();
 onMounted(async () => {
   await Promise.all([loadVoiceData(), loadSearchProviders()]);
   syncSourceDrafts();
-  // 静默预拉模型列表填充下拉：仅联网填充，不弹通知（提示交给用户主动点「刷新」）
-  if (state.config.ai_config.api_url && state.config.ai_config.api_key) {
-    void refreshAiModels(true).then(() => {
-      // 同步自定义模式：当前模型名不在列表里（且非空）→ 视为手填自定义
-      const cur = state.config.ai_config.model || '';
-      modelCustomActive.value = !!cur && !aiModelsList.value.some((m) => m.id === cur);
-    });
-  }
   if (state.config.conversation_monitor_enabled) connectConversation();
-  // 反查当前 api_url 命中的预设：命中则高亮该预设（隐藏地址框），无匹配则归为「自定义」（显示地址框）
-  const cur = (state.config.ai_config.api_url || '').trim().replace(/\/+$/, '');
-  const hit = AI_PRESET_PROVIDERS.find((p) => p.baseUrl.replace(/\/+$/, '') === cur);
-  selectedAiPreset.value = hit ? hit.id : 'custom';
 });
 onUnmounted(() => {
   conversationSocket?.close();
@@ -334,11 +301,11 @@ async function setConversationEnabled(enabled: boolean): Promise<void> {
   const patch = enabled
     ? { conversation_monitor_enabled: true }
     : {
-        conversation_monitor_enabled: false,
-        voice_command_enabled: false,
-        external_search_enabled: false,
-        ai_config: { ...state.config.ai_config, enabled: false },
-      };
+      conversation_monitor_enabled: false,
+      voice_command_enabled: false,
+      external_search_enabled: false,
+      ai_config: { ...state.config.ai_config, enabled: false },
+    };
   try {
     await saveConfig(patch);
     enabled ? connectConversation() : disconnectConversation();
@@ -353,21 +320,11 @@ async function setVoiceEnabled(enabled: boolean): Promise<void> {
   const patch = enabled
     ? { voice_command_enabled: true }
     : {
-        voice_command_enabled: false,
-        external_search_enabled: false,
-        ai_config: { ...state.config.ai_config, enabled: false },
-      };
+      voice_command_enabled: false,
+      external_search_enabled: false,
+      ai_config: { ...state.config.ai_config, enabled: false },
+    };
   try { await saveConfig(patch); } catch { /* saveConfig presents the error */ }
-}
-
-async function setAIEnabled(enabled: boolean): Promise<void> {
-  if (enabled && !state.config.voice_command_enabled) {
-    notify('请先开启语音口令', 'warning');
-    return;
-  }
-  try {
-    await saveConfig({ ai_config: { ...state.config.ai_config, enabled } });
-  } catch { /* saveConfig presents the error */ }
 }
 
 async function setExternalSearchEnabled(enabled: boolean): Promise<void> {
@@ -413,8 +370,9 @@ function connectConversation(): void {
     conversationSocket.onmessage = (event) => {
       try {
         const frame = JSON.parse(String(event.data));
-        if (frame.type === 'snapshot') state.conversationMessages = frame.data || [];
-        else if (frame.type === 'message') state.conversationMessages.unshift(frame.data);
+        // 快照与增量帧都过排序/upsert：到达顺序（含同批多条、outcome 补推）不再影响展示顺序
+        if (frame.type === 'snapshot') state.conversationMessages = sortConversationDesc(frame.data || []);
+        else if (frame.type === 'message') state.conversationMessages = upsertConversationMessage(state.conversationMessages, frame.data);
       } catch { /* ignore malformed stream frame */ }
     };
     conversationSocket.onerror = () => conversationSocket?.close();
@@ -520,102 +478,6 @@ async function testCommand(): Promise<void> {
   } finally {
     commandTestBusy.value = false;
   }
-}
-
-async function testAI(): Promise<void> {
-  if (!aiTestQuery.value.trim()) return;
-  aiTestBusy.value = true;
-  try {
-    const result = await post<Record<string, unknown>>('/voice-commands/ai-test', { query: aiTestQuery.value.trim() });
-    aiTestResult.value = JSON.stringify(result, null, 2);
-  } catch (error) {
-    aiTestResult.value = messageOf(error);
-  } finally {
-    aiTestBusy.value = false;
-  }
-}
-
-/**
- * 拉取可用模型列表，同时测量连通性与延迟（配置页「连接状态/延迟」的数据源）。
- * @param silent true=静默预检（进页面自动执行，不弹通知）；false=用户主动点刷新（弹通知）
- */
-async function refreshAiModels(silent = false): Promise<void> {
-  if (!state.config.ai_config.api_url || !state.config.ai_config.api_key) {
-    aiConnState.value = 'idle';
-    return;
-  }
-  aiModelLoading.value = true;
-  aiModelError.value = '';
-  aiModelsList.value = [];
-  aiConnState.value = 'loading';
-  const startedAt = Date.now();
-  try {
-    await loadAiModels();
-    aiModelsList.value = Array.isArray(state.aiModels) ? state.aiModels : [];
-    aiConnLatency.value = Date.now() - startedAt;
-    aiConnState.value = 'ok';
-    if (!silent) notify(`已获取 ${aiModelsList.value.length} 个可用模型，延迟 ${aiConnLatency.value} ms`, 'success');
-  } catch (error) {
-    aiModelError.value = messageOf(error);
-    aiModelsList.value = [];
-    aiConnLatency.value = null;
-    aiConnState.value = 'error';
-    if (!silent) notify(aiModelError.value, 'error');
-  } finally {
-    aiModelLoading.value = false;
-  }
-}
-
-const aiConnChipClass = computed(() => {
-  if (aiConnState.value === 'ok') return 'chip-success';
-  if (aiConnState.value === 'error') return 'chip-warning';
-  return '';
-});
-
-const aiConnText = computed(() => {
-  const configured = !!state.config.ai_config.api_url && !!state.config.ai_config.api_key;
-  switch (aiConnState.value) {
-    case 'loading': return '连接检测中…';
-    case 'ok': return `已连接 · ${aiConnLatency.value} ms`;
-    case 'error': return `连接失败：${aiModelError.value}`;
-    default: return configured ? '未检测' : '未配置';
-  }
-});
-
-// --- end of model fetching ---
-
-// 模型下拉末尾固定追加「自定义模型名…」，选中才展开手填框（避免常驻冗余输入框）
-const AI_MODEL_CUSTOM = '__custom_model__';
-
-const aiModelOptions = computed<SelectOption[]>(() => [
-  ...aiModelsList.value.map((m) => ({
-    value: m.id,
-    label: m.ownedBy ? `${m.id} (${m.ownedBy})` : m.id,
-    searchText: m.id,
-  })),
-  { value: AI_MODEL_CUSTOM, label: '自定义模型名…', searchText: '自定义' },
-]);
-
-// 当前是否处于「自定义模型名」模式：下拉选了自定义项即展开输入框
-const modelCustomActive = ref(false);
-// 下拉回显值：自定义模式下映射为哨兵项，否则为实际模型名
-const aiModelSelectValue = computed(() =>
-  modelCustomActive.value ? AI_MODEL_CUSTOM : (state.config.ai_config.model || ''),
-);
-
-/**
- * 模型下拉选择处理。
- * 注意：必须放在 script 方法里调用（模板内联表达式会把 ref 自动解包成原始值，
- * 直接写 `modelCustomActive.value = ...` 会触发 WebF 的 readonly 赋值报错）。
- */
-function onModelSelect(v: string): void {
-  if (v === AI_MODEL_CUSTOM) {
-    modelCustomActive.value = true; // 选「自定义模型名…」：仅展开输入框，不改 model
-    return;
-  }
-  modelCustomActive.value = false;
-  state.config.ai_config.model = v;
-  void saveConfig({ ai_config: state.config.ai_config });
 }
 
 async function addSource(): Promise<void> {
@@ -862,13 +724,20 @@ function formatOutcomeMeta(item: ConversationMessage): string {
 </script>
 
 <template>
+  <VoiceSectionNav v-model="voicePanel" :panels="voicePanels" />
+
+  <div v-show="voicePanel === 'listen'" class="voice-panel" data-voice-panel="listen">
   <SectionCard title="对话监听" icon="record_voice_over" description="监听已启用管理的音箱对话记录，并把语音内容交给语音引擎。">
     <SettingRow title="启用对话监听" subtitle="关闭后会同时关闭语音口令、AI 分析和外部搜索">
-      <SlSwitch :model-value="state.config.conversation_monitor_enabled" @update:model-value="setConversationEnabled" />
+      <SlSwitch aria-label="启用对话监听" :model-value="state.config.conversation_monitor_enabled" @update:model-value="setConversationEnabled" />
     </SettingRow>
     <div class="form-body">
       <div class="field-grid">
-        <div class="field"><label class="field-label">轮询间隔（秒）</label><SlInput :model-value="pollInterval" type="number" @update:model-value="pollInterval = $event" @change="saveNumber('conversation_poll_interval', pollInterval, 1, 30)" /></div>
+        <div class="field">
+          <label class="field-label">轮询间隔（秒）</label>
+          <SlInput :model-value="pollInterval" type="number" @update:model-value="pollInterval = $event" @change="saveNumber('conversation_poll_interval', pollInterval, 1, 30)" />
+          <p class="field-help">默认 2 秒，可设 1～30 秒。无新对话时逐步延长到 5 秒，所设间隔超过 5 秒时保持该值；收到新对话后恢复所设间隔。</p>
+        </div>
         <div class="field setting-field-control"><label class="field-label">调试日志</label><SlSwitch :model-value="state.config.debug_log_enabled" @update:model-value="setSwitch('debug_log_enabled', $event)" /></div>
       </div>
       <div v-if="state.config.conversation_monitor_enabled" class="status-panel status-panel-inset">
@@ -909,10 +778,12 @@ function formatOutcomeMeta(item: ConversationMessage): string {
       <div class="field-actions"><SlButton variant="outlined" label="刷新索引" icon="refresh" @click="refreshIndex" /></div>
     </div>
   </SectionCard>
+  </div>
 
+  <div v-show="voicePanel === 'commands'" class="voice-panel" data-voice-panel="commands">
   <SectionCard title="语音口令" icon="mic" description="为每种操作维护可识别的口令词；添加、删除和启停都会立即保存。">
     <SettingRow title="启用语音口令" :subtitle="state.config.conversation_monitor_enabled ? '将对话监听结果交给播放器执行' : '需要先开启对话监听'">
-      <SlSwitch :model-value="state.config.voice_command_enabled" :disabled="!state.config.conversation_monitor_enabled" @update:model-value="setVoiceEnabled" />
+      <SlSwitch aria-label="启用语音口令" :model-value="state.config.voice_command_enabled" :disabled="!state.config.conversation_monitor_enabled" @update:model-value="setVoiceEnabled" />
     </SettingRow>
     <div v-if="!state.config.conversation_monitor_enabled" class="dependency-hint"><SlIcon name="warning" :size="18" /><span>需要先开启"对话监听"才能使用语音口令。</span></div>
     <div v-if="state.config.voice_command_enabled" class="dependency-hint"><SlIcon name="info" :size="18" /><span>口令触发后，音箱会先播完自身的语音回复，再由插件打断并开始播放，中间会有短暂延迟。</span></div>
@@ -955,8 +826,38 @@ function formatOutcomeMeta(item: ConversationMessage): string {
     </div>
   </SectionCard>
 
+  <SectionCard title="问答接管" icon="forum" description="播放类指令之外的问题：小爱能答则不打扰，答不上来由大模型接管回答（可联网）。">
+    <SettingRow title="启用问答接管" :subtitle="state.config.voice_command_enabled ? '先等小爱原生回答，答不上来才切换问答模型' : '需要先开启语音口令'"><SlSwitch :model-value="!!state.config.qa_config?.enabled" :disabled="!state.config.voice_command_enabled" @update:model-value="setQAEnabled" /></SettingRow>
+    <div v-if="!state.config.voice_command_enabled" class="dependency-hint"><SlIcon name="warning" :size="18" /><span>需要先开启"语音口令"才能使用问答接管。</span></div>
+    <div class="form-body">
+      <div class="field"><label class="field-label">API 地址</label><SlInput :model-value="state.config.qa_config?.api_url || ''" placeholder="https://ark.cn-beijing.volces.com/api/v3" @update:model-value="state.config.qa_config.api_url = $event" @change="qaSave" /><p class="field-help">OpenAI 兼容地址；火山方舟填到 /api/v3，与语义判定模型可各配各的服务商。</p></div>
+      <div class="field"><label class="field-label">API Key</label><SlInput :model-value="state.config.qa_config?.api_key || ''" type="password" placeholder="ark-..." @update:model-value="state.config.qa_config.api_key = $event" @change="qaSave" /></div>
+      <div class="field-grid">
+        <div class="field"><label class="field-label">模型</label><SlInput :model-value="state.config.qa_config?.model || ''" placeholder="如 doubao-1.5-pro-32k" @update:model-value="state.config.qa_config.model = $event" @change="qaSave" /></div>
+        <div class="field"><label class="field-label">超时（秒）</label><SlInput :model-value="String(state.config.qa_config?.timeout || 60)" type="number" @update:model-value="state.config.qa_config.timeout = Math.max(1, Math.min(180, Number($event) || 60))" @change="qaSave" /></div>
+      </div>
+      <div class="field-grid">
+        <div class="field setting-field-control"><label class="field-label">联网搜索</label><SlSwitch :model-value="!!state.config.qa_config?.web_search_enabled" @update:model-value="setQAWebSearch" /></div>
+        <div class="field"><label class="field-label">搜索策略</label><SlSelect :model-value="state.config.qa_config?.web_search_strategy || 'hybrid'" :options="qaSearchStrategyOptions" aria-label="联网搜索策略" @update:model-value="setQAStrategy" /></div>
+      </div>
+      <p class="field-help">联网搜索走火山方舟 Responses API（web_search 工具），需在方舟控制台开通「联网搜索」内容插件；"按需联网"只在问到天气/新闻/股价等时效性话题时联网，失败自动降级普通回答。</p>
+      <div class="field"><label class="field-label">人设提示词</label><SlInput :model-value="state.config.qa_config?.system_prompt || ''" placeholder="问答人设与回答长度约束" @update:model-value="state.config.qa_config.system_prompt = $event" @change="qaSave" /></div>
+      <div class="field-grid">
+        <div class="field"><label class="field-label">思考提示</label><SlInput :model-value="state.config.qa_config?.thinking_notice ?? ''" placeholder="打断小爱后先播的提示，留空关闭" @update:model-value="state.config.qa_config.thinking_notice = $event" @change="qaSave" /></div>
+        <div class="field"><label class="field-label">历史轮数（0-20）</label><SlInput :model-value="String(state.config.qa_config?.history_max_length ?? 10)" type="number" @update:model-value="state.config.qa_config.history_max_length = Math.max(0, Math.min(20, Number($event) || 0))" @change="qaSave" /></div>
+      </div>
+      <div class="field-grid">
+        <div class="field"><label class="field-label">等待原生回答（秒）</label><SlInput :model-value="String(state.config.qa_config?.native_answer_wait_sec ?? 4)" type="number" @update:model-value="state.config.qa_config.native_answer_wait_sec = Math.max(0, Math.min(10, Number($event) || 0))" @change="qaSave" /><p class="field-help">0-10 秒；等小爱先答，命中"不知道/没听懂"类回答才接管。</p></div>
+        <div class="field"><label class="field-label">单段播报上限</label><SlInput :model-value="String(state.config.qa_config?.max_reply_length ?? 100)" type="number" @update:model-value="state.config.qa_config.max_reply_length = Math.max(0, Math.min(500, Number($event) || 0))" @change="qaSave" /><p class="field-help">超长回答按句切分逐段播报，0 表示不切分。</p></div>
+      </div>
+      <div class="command-test-panel command-test-panel-inset"><strong>问答测试</strong><p>直接验证问答模型与联网搜索，不会打断音箱播报。</p><div class="inline-fields"><SlInput v-model="qaTestQuery" placeholder="问点什么，比如：今天北京天气怎么样" @submit="testQA" /><SlButton variant="outlined" label="测试问答" icon="science" :disabled="qaTestBusy" @click="testQA" /></div><pre v-if="qaTestResult" class="result-pre" :class="qaTestSuccess ? 'result-success' : 'result-error'">{{ qaTestResult }}</pre></div>
+    </div>
+  </SectionCard>
+  </div>
+
+  <div v-show="voicePanel === 'memory'" class="voice-panel" data-voice-panel="memory">
   <SectionCard title="语音记忆" icon="memory" description="记录用户说法与歌曲实体的对应关系，减少重复 AI 分析。">
-    <SettingRow title="启用语音记忆" subtitle="关闭后保留历史记忆，但不再写入新记录"><SlSwitch :model-value="state.config.voice_memory_enabled" @update:model-value="setSwitch('voice_memory_enabled', $event)" /></SettingRow>
+    <SettingRow title="启用语音记忆" subtitle="关闭后保留历史记忆，但不再写入新记录"><SlSwitch aria-label="启用语音记忆" :model-value="state.config.voice_memory_enabled" @update:model-value="setSwitch('voice_memory_enabled', $event)" /></SettingRow>
     <div class="form-body">
       <button type="button" class="advanced-toggle" @click="toggleMemoryExpanded">
         <span>{{ memoryExpanded ? '收起语音记忆' : '展开语音记忆' }}</span>
@@ -983,9 +884,11 @@ function formatOutcomeMeta(item: ConversationMessage): string {
       </div>
     </div>
   </SectionCard>
+  </div>
 
+  <div v-show="voicePanel === 'intelligence'" class="voice-panel" data-voice-panel="intelligence">
   <SectionCard title="外部搜索" icon="search" description="本地曲库未命中时，按优先级调用已启用的搜索源。">
-    <SettingRow title="启用外部搜索" :subtitle="state.config.voice_command_enabled ? '搜索源需要返回 topone 格式结果' : '需要先开启语音口令'"><SlSwitch :model-value="state.config.external_search_enabled" :disabled="!state.config.voice_command_enabled" @update:model-value="setExternalSearchEnabled" /></SettingRow>
+    <SettingRow title="启用外部搜索" :subtitle="state.config.voice_command_enabled ? '搜索源需要返回 topone 格式结果' : '需要先开启语音口令'"><SlSwitch aria-label="启用外部搜索" :model-value="state.config.external_search_enabled" :disabled="!state.config.voice_command_enabled" @update:model-value="setExternalSearchEnabled" /></SettingRow>
     <div v-if="!state.config.voice_command_enabled" class="dependency-hint"><SlIcon name="warning" :size="18" /><span>需要先开启"语音口令"才能使用外部搜索。</span></div>
     <div class="form-body">
       <div class="field"><label class="field-label">搜索优先级</label><SlSelect :model-value="state.config.search_priority" :options="searchPriorityOptions" aria-label="搜索优先级" @update:model-value="saveConfig({ search_priority: $event as 'parallel' | 'local_first' | 'external_first' })" /></div>
@@ -1014,12 +917,11 @@ function formatOutcomeMeta(item: ConversationMessage): string {
       <h3 class="card-title section-subtitle">已配置源</h3>
       <div v-for="source in state.config.external_search_sources" :key="source.id" class="sub-panel sub-panel-inset">
         <!-- 各包一层 .field 是为了拿到与其它表单行一致的 16px 行距：.field-grid 的
-             row-gap 是 0，裸 input 会挤在一起。这一行在 APP 里整体不显示的根因是
-             WebF 不绘制 grid 容器，已在 style.css 把 .field-grid 改成 flex
-             （songloft-org/songloft-plugin-miot#79）。 -->
+             row-gap 是 0，裸 input 会挤在一起。.field-grid 用 flex 而非 grid 的
+             原因见 style.css（songloft-org/songloft-plugin-miot#79）。 -->
         <div class="field-grid"><div class="field"><SlInput v-model="sourceDrafts[source.id].name" placeholder="显示名称" /></div><div class="field"><SlInput v-model="sourceDrafts[source.id].url" placeholder="接口地址" /></div></div>
         <SlInput v-model="sourceDrafts[source.id].token" type="password" placeholder="Bearer Token（可选）" />
-        <SettingRow title="启用此源"><SlSwitch v-model="sourceDrafts[source.id].enabled" /></SettingRow>
+        <SettingRow title="启用此源"><SlSwitch v-model="sourceDrafts[source.id].enabled" :aria-label="`启用搜索源 ${sourceDrafts[source.id].name || source.id}`" /></SettingRow>
         <div class="field-actions"><SlButton variant="text" label="移除" icon="delete" @click="removeSource(source.id)" /></div>
       </div>
       <div v-if="!state.config.external_search_sources.length" class="empty-state">暂无已配置源，从上方「快速选择」添加，或手动添加</div>
@@ -1032,90 +934,8 @@ function formatOutcomeMeta(item: ConversationMessage): string {
     </div>
   </SectionCard>
 
-  <SectionCard title="AI 口令分析" icon="auto_awesome" description="可选的 OpenAI 兼容接口，用于解析复杂自然语言口令。">
-    <SettingRow title="启用 AI 分析" :subtitle="state.config.voice_command_enabled ? '规则和记忆未命中时再调用 AI' : '需要先开启语音口令'"><SlSwitch :model-value="!!state.config.ai_config.enabled" :disabled="!state.config.voice_command_enabled" @update:model-value="setAIEnabled" /></SettingRow>
-    <div v-if="!state.config.voice_command_enabled" class="dependency-hint"><SlIcon name="warning" :size="18" /><span>需要先开启"语音口令"才能使用 AI 分析。</span></div>
-    <div class="form-body">
-      <div class="field">
-        <label class="field-label">预设服务商</label>
-        <SlSelect
-          :model-value="selectedAiPreset"
-          :options="aiPresetOptions"
-          placeholder="选择预设或自定义"
-          aria-label="选择 AI 预设服务商"
-          @update:model-value="applyAiPreset"
-        />
-      </div>
-      <div v-if="selectedAiPreset === 'custom'" class="field"><label class="field-label">API 地址</label><SlInput :model-value="state.config.ai_config.api_url || ''" placeholder="https://api.example.com/v1" @update:model-value="state.config.ai_config.api_url = $event" @change="saveConfig({ ai_config: state.config.ai_config })" /></div>
-      <div class="field"><label class="field-label">API Key</label><SlInput :model-value="state.config.ai_config.api_key || ''" type="password" placeholder="sk-..." @update:model-value="state.config.ai_config.api_key = $event" @change="saveConfig({ ai_config: state.config.ai_config })" /></div>
-      <a v-if="selectedAiPresetObj" class="preset-key-link" :href="selectedAiPresetObj.apiKeyUrl" target="_blank" rel="noopener" :title="`官网：${selectedAiPresetObj.websiteUrl}`">前往 {{ selectedAiPresetObj.name }} 获取 API Key ↗</a>
-      <div class="field-grid">
-        <div class="field">
-          <label class="field-label">模型</label>
-          <!-- 复用 .inline-fields 而不是手写 display:flex：见 style.css .model-row 注释，
-               WebF 下子项没有显式 flex 尺寸就不会收缩，下拉会把「刷新」挤出本列。 -->
-          <div class="inline-fields model-row">
-            <SlSelect
-              :model-value="aiModelSelectValue"
-              :options="aiModelOptions"
-              placeholder="点击刷新获取可用模型"
-              aria-label="选择 AI 模型"
-              searchable
-              search-placeholder="搜索模型名称"
-              @update:model-value="onModelSelect"
-            />
-            <SlButton variant="outlined" label="刷新" icon="refresh" :disabled="aiModelLoading || !state.config.ai_config.api_url || !state.config.ai_config.api_key" @click="() => refreshAiModels()" title="调用 /models 预检 API、获取模型列表并测量延迟" />
-          </div>
-          <!-- 自定义模型名：仅在下拉选「自定义模型名…」或当前模型不在列表时展开（部分服务不支持 /v1/models 或列表缺目标模型） -->
-          <template v-if="modelCustomActive">
-            <!-- 不套 auto 宽的裸 div：Flutter 系输入框是 RenderWidget，包一层会被 WebF
-                 量到视口宽（SlButton.vue 顶部注释同源），间距用自身 margin-top。 -->
-            <SlInput
-              class="model-custom-input"
-              :model-value="state.config.ai_config.model || ''"
-              placeholder="手动填写模型名，如 qwen-plus"
-              aria-label="手动填写 AI 模型名"
-              @update:model-value="state.config.ai_config.model = $event"
-              @change="saveConfig({ ai_config: state.config.ai_config })"
-            />
-            <div class="field-help">若接口不支持 /v1/models 或列表没有目标模型，可直接填写模型名。</div>
-          </template>
-        </div>
-        <div class="field"><label class="field-label">超时（秒）</label><SlInput :model-value="String(state.config.ai_config.timeout || 6)" type="number" @update:model-value="state.config.ai_config.timeout = Math.max(1, Math.min(30, Number($event) || 6))" @change="saveConfig({ ai_config: state.config.ai_config })" /></div>
-      </div>
-      <div class="status-chips">
-        <span class="chip" :class="aiConnChipClass">{{ aiConnText }}</span>
-      </div>
-      <div v-if="aiModelError" class="field-help" style="color:#ef5350;">{{ aiModelError }}</div>
-      <div class="command-test-panel command-test-panel-inset"><strong>AI 分析测试</strong><div class="inline-fields"><SlInput v-model="aiTestQuery" placeholder="输入自然语言口令" @submit="testAI" /><SlButton variant="outlined" label="测试分析" icon="science" :disabled="aiTestBusy" @click="testAI" /></div><pre v-if="aiTestResult" class="result-pre">{{ aiTestResult }}</pre></div>
-    </div>
+  <SectionCard title="AI 设置" icon="auto_awesome" description="模型连接、口令分析、AI 对话和长期记忆在同一处配置。">
+    <div class="form-body"><SlButton label="打开 AI 设置" icon="auto_awesome" variant="outlined" @click="navigation.settingsCategory = 'ai'" /></div>
   </SectionCard>
-
-  <SectionCard title="问答接管" icon="forum" description="播放类指令之外的问题：小爱能答则不打扰，答不上来由大模型接管回答（可联网）。">
-    <SettingRow title="启用问答接管" :subtitle="state.config.voice_command_enabled ? '先等小爱原生回答，答不上来才切换问答模型' : '需要先开启语音口令'"><SlSwitch :model-value="!!state.config.qa_config?.enabled" :disabled="!state.config.voice_command_enabled" @update:model-value="setQAEnabled" /></SettingRow>
-    <div v-if="!state.config.voice_command_enabled" class="dependency-hint"><SlIcon name="warning" :size="18" /><span>需要先开启"语音口令"才能使用问答接管。</span></div>
-    <div class="form-body">
-      <div class="field"><label class="field-label">API 地址</label><SlInput :model-value="state.config.qa_config?.api_url || ''" placeholder="https://ark.cn-beijing.volces.com/api/v3" @update:model-value="state.config.qa_config.api_url = $event" @change="qaSave" /><p class="field-help">OpenAI 兼容地址；火山方舟填到 /api/v3，与语义判定模型可各配各的服务商。</p></div>
-      <div class="field"><label class="field-label">API Key</label><SlInput :model-value="state.config.qa_config?.api_key || ''" type="password" placeholder="ark-..." @update:model-value="state.config.qa_config.api_key = $event" @change="qaSave" /></div>
-      <div class="field-grid">
-        <div class="field"><label class="field-label">模型</label><SlInput :model-value="state.config.qa_config?.model || ''" placeholder="如 doubao-1.5-pro-32k" @update:model-value="state.config.qa_config.model = $event" @change="qaSave" /></div>
-        <div class="field"><label class="field-label">超时（秒）</label><SlInput :model-value="String(state.config.qa_config?.timeout || 60)" type="number" @update:model-value="state.config.qa_config.timeout = Math.max(1, Math.min(180, Number($event) || 60))" @change="qaSave" /></div>
-      </div>
-      <div class="field-grid">
-        <div class="field setting-field-control"><label class="field-label">联网搜索</label><SlSwitch :model-value="!!state.config.qa_config?.web_search_enabled" @update:model-value="setQAWebSearch" /></div>
-        <div class="field"><label class="field-label">搜索策略</label><SlSelect :model-value="state.config.qa_config?.web_search_strategy || 'hybrid'" :options="qaSearchStrategyOptions" aria-label="联网搜索策略" @update:model-value="setQAStrategy" /></div>
-      </div>
-      <p class="field-help">联网搜索走火山方舟 Responses API（web_search 工具），需在方舟控制台开通「联网搜索」内容插件；"按需联网"只在问到天气/新闻/股价等时效性话题时联网，失败自动降级普通回答。</p>
-      <div class="field"><label class="field-label">人设提示词</label><SlInput :model-value="state.config.qa_config?.system_prompt || ''" placeholder="问答人设与回答长度约束" @update:model-value="state.config.qa_config.system_prompt = $event" @change="qaSave" /></div>
-      <div class="field-grid">
-        <div class="field"><label class="field-label">思考提示</label><SlInput :model-value="state.config.qa_config?.thinking_notice ?? ''" placeholder="打断小爱后先播的提示，留空关闭" @update:model-value="state.config.qa_config.thinking_notice = $event" @change="qaSave" /></div>
-        <div class="field"><label class="field-label">历史轮数（0-20）</label><SlInput :model-value="String(state.config.qa_config?.history_max_length ?? 10)" type="number" @update:model-value="state.config.qa_config.history_max_length = Math.max(0, Math.min(20, Number($event) || 0))" @change="qaSave" /></div>
-      </div>
-      <div class="field-grid">
-        <div class="field"><label class="field-label">等待原生回答（秒）</label><SlInput :model-value="String(state.config.qa_config?.native_answer_wait_sec ?? 4)" type="number" @update:model-value="state.config.qa_config.native_answer_wait_sec = Math.max(0, Math.min(10, Number($event) || 0))" @change="qaSave" /><p class="field-help">0-10 秒；等小爱先答，命中"不知道/没听懂"类回答才接管。</p></div>
-        <div class="field"><label class="field-label">单段播报上限</label><SlInput :model-value="String(state.config.qa_config?.max_reply_length ?? 100)" type="number" @update:model-value="state.config.qa_config.max_reply_length = Math.max(0, Math.min(500, Number($event) || 0))" @change="qaSave" /><p class="field-help">超长回答按句切分逐段播报，0 表示不切分。</p></div>
-      </div>
-      <div class="command-test-panel command-test-panel-inset"><strong>问答测试</strong><p>直接验证问答模型与联网搜索，不会打断音箱播报。</p><div class="inline-fields"><SlInput v-model="qaTestQuery" placeholder="问点什么，比如：今天北京天气怎么样" @submit="testQA" /><SlButton variant="outlined" label="测试问答" icon="science" :disabled="qaTestBusy" @click="testQA" /></div><pre v-if="qaTestResult" class="result-pre" :class="qaTestSuccess ? 'result-success' : 'result-error'">{{ qaTestResult }}</pre></div>
-    </div>
-  </SectionCard>
+  </div>
 </template>

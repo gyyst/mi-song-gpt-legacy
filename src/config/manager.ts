@@ -20,6 +20,9 @@ import type {
   PlaylistProgress,
   PlaylistProgressStore,
 } from '../types';
+import { DEFAULT_CHAT_CONFIG, validateChatConfig } from '../chat/types';
+import type { ChatConfig } from '../chat/types';
+
 import { DEFAULT_MEMORY_MAX_RECORDS, normalizeMemoryMaxRecords } from '../memory/types';
 import { getDefaultVoiceCommands } from '../voicecmd/defaults';
 
@@ -93,9 +96,10 @@ function defaultPluginConfig(): PluginConfig {
     play_announcement_wait_mode: 'auto',
     play_announcement_delay: 3,
     play_announcement_scope: 'voice',
-    conversation_poll_interval: 1,
+    conversation_poll_interval: 2,
     debug_log_enabled: false,
     smart_resume_timeout: 30,
+    hourly_chime_resume_enabled: false,
     max_song_index: 10000,
     ai_config: defaultAIConfig(),
     qa_config: defaultQAConfig(),
@@ -158,6 +162,28 @@ export class ConfigManager {
   // 歌单进度表：每次切歌都要读改写，不缓存就是每首歌一次多余的 storage.get。
   // 与上面两个 key 同一套约定（缓存 in-flight Promise + 写穿透）。
   private playlistProgressCache: Promise<PlaylistProgressStore> | null = null;
+
+  private chatConfigWrite: Promise<unknown> = Promise.resolve();
+
+  async getChatConfig(): Promise<ChatConfig> {
+    await this.chatConfigWrite.catch(() => { });
+    const raw = await songloft.storage.get('chat_config:v1');
+    if (!raw) return validateChatConfig({});
+    try { return validateChatConfig(JSON.parse(raw as string)); }
+    catch { throw new Error('AI 对话配置损坏，原配置已保留'); }
+  }
+
+  saveChatConfig(updates: Partial<ChatConfig>): Promise<ChatConfig> {
+    const pending = this.chatConfigWrite.catch(() => { }).then(async () => {
+      const raw = await songloft.storage.get('chat_config:v1');
+      const current = raw ? validateChatConfig(JSON.parse(raw as string)) : DEFAULT_CHAT_CONFIG;
+      const next = validateChatConfig(updates, current);
+      await songloft.storage.set('chat_config:v1', JSON.stringify(next));
+      return next;
+    });
+    this.chatConfigWrite = pending;
+    return pending;
+  }
 
   // ===== 通用存储读写 =====
 
