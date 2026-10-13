@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
-import SectionCard from '../../ui/SectionCard.vue';
 import SettingRow from '../../ui/SettingRow.vue';
 import SlButton from '../../ui/SlButton.vue';
 import SlInput from '../../ui/SlInput.vue';
@@ -95,8 +94,9 @@ onUnmounted(() => { alive = false; requestVersion++; });
 </script>
 
 <template>
-  <SectionCard title="默认模型连接" icon="auto_awesome" description="口令分析与 AI 对话可共用此连接。即使未开启口令分析，也能用于对话。">
-    <div class="form-body">
+  <div class="form-body">
+    <h3 class="card-title">默认模型连接</h3>
+    <p class="field-help">口令分析与 AI 对话可共用此连接。即使未开启口令分析，也能用于对话。</p>
       <div class="field"><label class="field-label">服务商</label><SlSelect :model-value="selectedPreset" :options="presetOptions" aria-label="选择 AI 预设服务商" @update:model-value="applyPreset" /></div>
       <div v-if="selectedPreset === 'custom'" class="field"><label class="field-label">API 地址</label><SlInput v-model="state.config.ai_config.api_url" aria-label="默认 AI API 地址" placeholder="https://api.example.com/v1" @change="saveConnection().catch(() => {})" /></div>
       <div class="field"><label class="field-label">API 密钥</label><SlInput v-model="state.config.ai_config.api_key" type="password" aria-label="默认 AI API 密钥" @change="saveConnection().catch(() => {})" /></div>
@@ -112,13 +112,12 @@ onUnmounted(() => { alive = false; requestVersion++; });
       </div>
       <div class="status-chips"><span class="chip" :class="{ 'chip-success': connectionState === 'ok', 'chip-warning': connectionState === 'error' }">{{ connectionText }}</span></div>
     </div>
-  </SectionCard>
-  <SectionCard title="AI 口令分析" icon="mic" description="规则与点歌记忆未命中时，将自然语言解析成音乐控制口令。">
-    <SettingRow title="启用 AI 分析" :subtitle="state.config.voice_command_enabled ? '使用默认模型连接，与 AI 对话独立启用' : '需要先开启语音口令'"><SlSwitch aria-label="启用 AI 分析" :model-value="!!state.config.ai_config.enabled" :disabled="!state.config.voice_command_enabled" @update:model-value="enableAnalysis" /></SettingRow>
     <div class="form-body">
+      <h3 class="card-title section-subtitle">AI 口令分析</h3>
+      <p class="field-help">规则与点歌记忆未命中时，将自然语言解析成音乐控制口令。</p>
+      <SettingRow title="启用 AI 分析" :subtitle="state.config.voice_command_enabled ? '使用默认模型连接，与 AI 对话独立启用' : '需要先开启语音口令'"><SlSwitch aria-label="启用 AI 分析" :model-value="!!state.config.ai_config.enabled" :disabled="!state.config.voice_command_enabled" @update:model-value="enableAnalysis" /></SettingRow>
       <SlButton v-if="!state.config.voice_command_enabled" label="设置语音口令" variant="outlined" @click="navigation.settingsCategory = 'voice'" />
       <div class="field"><label class="field-label">口令分析超时（1–30 秒）</label><SlInput :model-value="String(state.config.ai_config.timeout || 6)" type="number" aria-label="AI 口令分析超时" @update:model-value="state.config.ai_config.timeout = Math.max(1, Math.min(30, Number($event) || 6))" @change="saveConnection().catch(() => {})" /></div>
       <div class="command-test-panel command-test-panel-inset"><strong>AI 分析测试</strong><p>仅测试解析，不执行播放。</p><div class="inline-fields"><SlInput v-model="testQuery" aria-label="AI 分析测试问题" placeholder="输入自然语言口令" @submit="testAnalysis" /><SlButton label="测试分析" variant="outlined" icon="science" :disabled="testBusy || !testQuery.trim()" @click="testAnalysis" /></div><pre v-if="testResult" class="result-pre">{{ testResult }}</pre></div>
     </div>
-  </SectionCard>
 </template>

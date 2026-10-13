@@ -4,7 +4,6 @@ import { DEFAULT_CHAT_CONFIG } from '../../../../src/chat/types';
 import type { ChatConfig, ChatMemory, ChatTurn } from '../../../../src/chat/types';
 import { del, get, messageOf, post, put, query } from '../../api';
 import { confirmAction, deviceId, deviceName, managedDevices, notify, saveConfig, selectDevice, state } from '../../store';
-import SectionCard from '../../ui/SectionCard.vue';
 import SettingRow from '../../ui/SettingRow.vue';
 import SlInput from '../../ui/SlInput.vue';
 import SlSwitch from '../../ui/SlSwitch.vue';
@@ -75,7 +74,8 @@ const safeAction = (run: () => Promise<void>) => { if (alive) void action(run); 
 <template>
   <fieldset class="chat-settings" :disabled="busy || !loaded">
     <p v-if="error" role="alert" class="chat-error">{{ error }}</p>
-    <SectionCard title="AI 对话" description="与音乐口令分析分别启用。默认说“请问……”开始，回答后可继续追问。">
+    <h3 class="card-title">AI 对话</h3>
+    <p class="field-help">与音乐口令分析分别启用。默认说“请问……”开始，回答后可继续追问。</p>
       <div class="form-body">
       <SettingRow title="启用 AI 对话"><SlSwitch v-model="config.enabled" :disabled="!loaded || busy" aria-label="启用 AI 对话" /></SettingRow>
       <p v-if="!state.config.conversation_monitor_enabled">语音问答需要对话监听。<SlButton label="一并开启监听" variant="outlined" @click="safeAction(async () => { await saveConfig({ conversation_monitor_enabled: true }); })" /></p>
@@ -85,8 +85,8 @@ const safeAction = (run: () => Promise<void>) => { if (alive) void action(run); 
       <label class="chat-field">追问窗口（秒，0 关闭）<SlInput :model-value="String(config.followup_seconds)" type="number" aria-label="追问窗口" @update:model-value="config.followup_seconds = Number($event)" /></label>
       <p>追问仍需唤醒音箱。分组播放时全组暂停，仅提问设备回答；播报结束无法确认时保持暂停。DLNA 投放中请先停止投放。</p>
       </div>
-    </SectionCard>
-    <SectionCard title="对话模型与角色" description="默认使用上方的模型连接。可单独选择对话模型，或改用独立连接。">
+    <h3 class="card-title section-subtitle">对话模型与角色</h3>
+    <p class="field-help">默认使用上方的模型连接。可单独选择对话模型，或改用独立连接。</p>
       <div class="form-body">
       <SlSelect :disabled="busy || !loaded" v-model="config.connection" :options="[{ value: 'analysis', label: '复用默认模型连接' }, { value: 'independent', label: '独立连接' }]" aria-label="对话模型连接" />
       <template v-if="config.connection === 'independent'">
@@ -101,8 +101,8 @@ const safeAction = (run: () => Promise<void>) => { if (alive) void action(run); 
       <label class="chat-field">角色提示词<textarea v-model="config.system_prompt" class="sl-input chat-textarea" aria-label="角色提示词" maxlength="4000"></textarea></label>
       <SlButton label="保存设置" :disabled="busy || !loaded" @click="safeAction(save)" />
       </div>
-    </SectionCard>
-    <SectionCard title="对话测试" description="使用当前选中的受管理音箱。关闭播报可测试模型而不暂停音乐。">
+    <h3 class="card-title section-subtitle">对话测试</h3>
+    <p class="field-help">使用当前选中的受管理音箱。关闭播报可测试模型而不暂停音乐。</p>
       <div class="form-body">
       <SlSelect :disabled="busy || !loaded" :model-value="deviceSelection" :options="deviceOptions" aria-label="对话设备" @update:model-value="safeAction(async () => { const [account, device] = JSON.parse($event); await selectDevice(account, device); })" />
       <p>当前状态：<strong>{{ phase }}</strong></p>
@@ -116,8 +116,8 @@ const safeAction = (run: () => Promise<void>) => { if (alive) void action(run); 
         <SlButton label="重置会话" variant="outlined" :disabled="busy || !target.device_id" @click="safeAction(async () => { await post('/chat/reset', target); await refresh(); })" />
       </div>
       </div>
-    </SectionCard>
-    <SectionCard title="聊天历史" description="按账号和设备隔离，默认保存 30 天、最多 500 轮。取消和失败也会显示。">
+    <h3 class="card-title section-subtitle">聊天历史</h3>
+    <p class="field-help">按账号和设备隔离，默认保存 30 天、最多 500 轮。取消和失败也会显示。</p>
       <div class="form-body">
       <p v-if="summary" class="chat-text">摘要：{{ summary }}</p>
       <p v-if="!history.length">暂无对话记录</p>
@@ -132,8 +132,8 @@ const safeAction = (run: () => Promise<void>) => { if (alive) void action(run); 
         <SlButton label="清空历史和摘要" variant="text" :disabled="busy || !target.device_id" @click="safeAction(() => clear('history'))" />
       </div>
       </div>
-    </SectionCard>
-    <SectionCard title="长期记忆" description="从已完成对话自动提取明确的用户事实与偏好。可关闭提取，手工编辑不会被覆盖。">
+    <h3 class="card-title section-subtitle">长期记忆</h3>
+    <p class="field-help">从已完成对话自动提取明确的用户事实与偏好。可关闭提取，手工编辑不会被覆盖。</p>
       <div class="form-body">
       <SettingRow title="自动提取与使用记忆"><SlSwitch v-model="config.memory_enabled" aria-label="长期记忆" /></SettingRow>
       <p>修改开关后请保存设置。</p>
@@ -156,7 +156,6 @@ const safeAction = (run: () => Promise<void>) => { if (alive) void action(run); 
         <SlButton label="全部清空" variant="text" :disabled="busy || !target.device_id" @click="safeAction(() => clear('all'))" />
       </div>
       </div>
-    </SectionCard>
   </fieldset>
 </template>
 

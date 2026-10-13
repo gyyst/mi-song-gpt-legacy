@@ -123,6 +123,7 @@ assert.match(voiceSectionNav, /update:modelValue/);
 assert.match(voiceSettings, /<VoiceSectionNav/);
 assert.match(voiceSettings, /data-voice-panel="listen"/);
 assert.match(voiceSettings, /data-voice-panel="intelligence"/);
+assert.match(voiceSettings, /<AISettings/);
 assert.match(playerBar, /role="slider"/);
 assert.match(playerBar, /onProgressKeydown/);
 assert.match(playerBar, /onBarSurfaceClick/);

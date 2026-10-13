@@ -8,8 +8,8 @@ import SlInput from '../../ui/SlInput.vue';
 import SlSelect from '../../ui/SlSelect.vue';
 import SlSwitch from '../../ui/SlSwitch.vue';
 import VoiceSectionNav from './voice/VoiceSectionNav.vue';
+import AISettings from './AISettings.vue';
 import { del, get, post, postLong, pluginWebSocketUrl } from '../../api';
-import { navigation } from '../../runtime';
 import {
   addWebhook,
   clearMemory,
@@ -37,7 +37,7 @@ const voicePanels: Array<{ id: VoicePanel; title: string; subtitle: string; icon
   { id: 'listen', title: '监听', subtitle: '对话与索引', icon: 'record_voice_over' },
   { id: 'commands', title: '口令', subtitle: '规则与测试', icon: 'mic' },
   { id: 'memory', title: '记忆', subtitle: '命中与歧义', icon: 'memory' },
-  { id: 'intelligence', title: '搜索', subtitle: '外部搜索源', icon: 'auto_awesome' },
+  { id: 'intelligence', title: '搜索', subtitle: '搜索与 AI 设置', icon: 'auto_awesome' },
 ];
 
 type VoicePanel = 'listen' | 'commands' | 'memory' | 'intelligence';
@@ -848,33 +848,6 @@ function formatOutcomeMeta(item: ConversationMessage): string {
     </div>
   </SectionCard>
 
-  <SectionCard title="问答接管" icon="forum" description="播放类指令之外的问题：小爱能答则不打扰，答不上来由大模型接管回答（可联网）。">
-    <SettingRow title="启用问答接管" :subtitle="state.config.voice_command_enabled ? '先等小爱原生回答，答不上来才切换问答模型' : '需要先开启语音口令'"><SlSwitch :model-value="!!state.config.qa_config?.enabled" :disabled="!state.config.voice_command_enabled" @update:model-value="setQAEnabled" /></SettingRow>
-    <div v-if="!state.config.voice_command_enabled" class="dependency-hint"><SlIcon name="warning" :size="18" /><span>需要先开启"语音口令"才能使用问答接管。</span></div>
-    <div class="form-body">
-      <div class="field"><label class="field-label">API 地址</label><SlInput :model-value="state.config.qa_config?.api_url || ''" placeholder="https://ark.cn-beijing.volces.com/api/v3" @update:model-value="state.config.qa_config.api_url = $event" @change="qaSave" /><p class="field-help">OpenAI 兼容地址；火山方舟填到 /api/v3，与语义判定模型可各配各的服务商。</p></div>
-      <div class="field"><label class="field-label">API Key</label><SlInput :model-value="state.config.qa_config?.api_key || ''" type="password" placeholder="ark-..." @update:model-value="state.config.qa_config.api_key = $event" @change="qaSave" /></div>
-      <div class="field-grid">
-        <div class="field"><label class="field-label">模型</label><SlInput :model-value="state.config.qa_config?.model || ''" placeholder="如 doubao-1.5-pro-32k" @update:model-value="state.config.qa_config.model = $event" @change="qaSave" /></div>
-        <div class="field"><label class="field-label">超时（秒）</label><SlInput :model-value="String(state.config.qa_config?.timeout || 60)" type="number" @update:model-value="state.config.qa_config.timeout = Math.max(1, Math.min(180, Number($event) || 60))" @change="qaSave" /></div>
-      </div>
-      <div class="field-grid">
-        <div class="field setting-field-control"><label class="field-label">联网搜索</label><SlSwitch :model-value="!!state.config.qa_config?.web_search_enabled" @update:model-value="setQAWebSearch" /></div>
-        <div class="field"><label class="field-label">搜索策略</label><SlSelect :model-value="state.config.qa_config?.web_search_strategy || 'hybrid'" :options="qaSearchStrategyOptions" aria-label="联网搜索策略" @update:model-value="setQAStrategy" /></div>
-      </div>
-      <p class="field-help">联网搜索走火山方舟 Responses API（web_search 工具），需在方舟控制台开通「联网搜索」内容插件；"按需联网"只在问到天气/新闻/股价等时效性话题时联网，失败自动降级普通回答。</p>
-      <div class="field"><label class="field-label">人设提示词</label><SlInput :model-value="state.config.qa_config?.system_prompt || ''" placeholder="问答人设与回答长度约束" @update:model-value="state.config.qa_config.system_prompt = $event" @change="qaSave" /></div>
-      <div class="field-grid">
-        <div class="field"><label class="field-label">思考提示</label><SlInput :model-value="state.config.qa_config?.thinking_notice ?? ''" placeholder="打断小爱后先播的提示，留空关闭" @update:model-value="state.config.qa_config.thinking_notice = $event" @change="qaSave" /></div>
-        <div class="field"><label class="field-label">历史轮数（0-20）</label><SlInput :model-value="String(state.config.qa_config?.history_max_length ?? 10)" type="number" @update:model-value="state.config.qa_config.history_max_length = Math.max(0, Math.min(20, Number($event) || 0))" @change="qaSave" /></div>
-      </div>
-      <div class="field-grid">
-        <div class="field"><label class="field-label">等待原生回答（秒）</label><SlInput :model-value="String(state.config.qa_config?.native_answer_wait_sec ?? 4)" type="number" @update:model-value="state.config.qa_config.native_answer_wait_sec = Math.max(0, Math.min(10, Number($event) || 0))" @change="qaSave" /><p class="field-help">0-10 秒；等小爱先答，命中"不知道/没听懂"类回答才接管。</p></div>
-        <div class="field"><label class="field-label">单段播报上限</label><SlInput :model-value="String(state.config.qa_config?.max_reply_length ?? 100)" type="number" @update:model-value="state.config.qa_config.max_reply_length = Math.max(0, Math.min(500, Number($event) || 0))" @change="qaSave" /><p class="field-help">超长回答按句切分逐段播报，0 表示不切分。</p></div>
-      </div>
-      <div class="command-test-panel command-test-panel-inset"><strong>问答测试</strong><p>直接验证问答模型与联网搜索，不会打断音箱播报。</p><div class="inline-fields"><SlInput v-model="qaTestQuery" placeholder="问点什么，比如：今天北京天气怎么样" @submit="testQA" /><SlButton variant="outlined" label="测试问答" icon="science" :disabled="qaTestBusy" @click="testQA" /></div><pre v-if="qaTestResult" class="result-pre" :class="qaTestSuccess ? 'result-success' : 'result-error'">{{ qaTestResult }}</pre></div>
-    </div>
-  </SectionCard>
   </div>
 
   <div v-show="voicePanel === 'memory'" class="voice-panel" data-voice-panel="memory">
@@ -956,8 +929,34 @@ function formatOutcomeMeta(item: ConversationMessage): string {
     </div>
   </SectionCard>
 
-  <SectionCard title="AI 设置" icon="auto_awesome" description="模型连接、口令分析、AI 对话和长期记忆在同一处配置。">
-    <div class="form-body"><SlButton label="打开 AI 设置" icon="auto_awesome" variant="outlined" @click="navigation.settingsCategory = 'ai'" /></div>
-  </SectionCard>
+  <AISettings>
+    <div class="form-body">
+      <h3 class="card-title">问答接管</h3>
+      <p class="field-help">播放类指令之外的问题：小爱能答则不打扰，答不上来由大模型接管回答（可联网）。</p>
+      <SettingRow title="启用问答接管" :subtitle="state.config.voice_command_enabled ? '先等小爱原生回答，答不上来才切换问答模型' : '需要先开启语音口令'"><SlSwitch :model-value="!!state.config.qa_config?.enabled" :disabled="!state.config.voice_command_enabled" @update:model-value="setQAEnabled" /></SettingRow>
+      <div v-if="!state.config.voice_command_enabled" class="dependency-hint"><SlIcon name="warning" :size="18" /><span>需要先开启"语音口令"才能使用问答接管。</span></div>
+        <div class="field"><label class="field-label">API 地址</label><SlInput :model-value="state.config.qa_config?.api_url || ''" placeholder="https://ark.cn-beijing.volces.com/api/v3" @update:model-value="state.config.qa_config.api_url = $event" @change="qaSave" /><p class="field-help">OpenAI 兼容地址；火山方舟填到 /api/v3，与语义判定模型可各配各的服务商。</p></div>
+        <div class="field"><label class="field-label">API Key</label><SlInput :model-value="state.config.qa_config?.api_key || ''" type="password" placeholder="ark-..." @update:model-value="state.config.qa_config.api_key = $event" @change="qaSave" /></div>
+        <div class="field-grid">
+          <div class="field"><label class="field-label">模型</label><SlInput :model-value="state.config.qa_config?.model || ''" placeholder="如 doubao-1.5-pro-32k" @update:model-value="state.config.qa_config.model = $event" @change="qaSave" /></div>
+          <div class="field"><label class="field-label">超时（秒）</label><SlInput :model-value="String(state.config.qa_config?.timeout || 60)" type="number" @update:model-value="state.config.qa_config.timeout = Math.max(1, Math.min(180, Number($event) || 60))" @change="qaSave" /></div>
+        </div>
+        <div class="field-grid">
+          <div class="field setting-field-control"><label class="field-label">联网搜索</label><SlSwitch :model-value="!!state.config.qa_config?.web_search_enabled" @update:model-value="setQAWebSearch" /></div>
+          <div class="field"><label class="field-label">搜索策略</label><SlSelect :model-value="state.config.qa_config?.web_search_strategy || 'hybrid'" :options="qaSearchStrategyOptions" aria-label="联网搜索策略" @update:model-value="setQAStrategy" /></div>
+        </div>
+        <p class="field-help">联网搜索走火山方舟 Responses API（web_search 工具），需在方舟控制台开通「联网搜索」内容插件；"按需联网"只在问到天气/新闻/股价等时效性话题时联网，失败自动降级普通回答。</p>
+        <div class="field"><label class="field-label">人设提示词</label><SlInput :model-value="state.config.qa_config?.system_prompt || ''" placeholder="问答人设与回答长度约束" @update:model-value="state.config.qa_config.system_prompt = $event" @change="qaSave" /></div>
+        <div class="field-grid">
+          <div class="field"><label class="field-label">思考提示</label><SlInput :model-value="state.config.qa_config?.thinking_notice ?? ''" placeholder="打断小爱后先播的提示，留空关闭" @update:model-value="state.config.qa_config.thinking_notice = $event" @change="qaSave" /></div>
+          <div class="field"><label class="field-label">历史轮数（0-20）</label><SlInput :model-value="String(state.config.qa_config?.history_max_length ?? 10)" type="number" @update:model-value="state.config.qa_config.history_max_length = Math.max(0, Math.min(20, Number($event) || 0))" @change="qaSave" /></div>
+        </div>
+        <div class="field-grid">
+          <div class="field"><label class="field-label">等待原生回答（秒）</label><SlInput :model-value="String(state.config.qa_config?.native_answer_wait_sec ?? 4)" type="number" @update:model-value="state.config.qa_config.native_answer_wait_sec = Math.max(0, Math.min(10, Number($event) || 0))" @change="qaSave" /><p class="field-help">0-10 秒；等小爱先答，命中"不知道/没听懂"类回答才接管。</p></div>
+          <div class="field"><label class="field-label">单段播报上限</label><SlInput :model-value="String(state.config.qa_config?.max_reply_length ?? 100)" type="number" @update:model-value="state.config.qa_config.max_reply_length = Math.max(0, Math.min(500, Number($event) || 0))" @change="qaSave" /><p class="field-help">超长回答按句切分逐段播报，0 表示不切分。</p></div>
+        </div>
+        <div class="command-test-panel command-test-panel-inset"><strong>问答测试</strong><p>直接验证问答模型与联网搜索，不会打断音箱播报。</p><div class="inline-fields"><SlInput v-model="qaTestQuery" placeholder="问点什么，比如：今天北京天气怎么样" @submit="testQA" /><SlButton variant="outlined" label="测试问答" icon="science" :disabled="qaTestBusy" @click="testQA" /></div><pre v-if="qaTestResult" class="result-pre" :class="qaTestSuccess ? 'result-success' : 'result-error'">{{ qaTestResult }}</pre></div>
+    </div>
+  </AISettings>
   </div>
 </template>

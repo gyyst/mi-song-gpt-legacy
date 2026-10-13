@@ -126,19 +126,22 @@ test('failed save prevents model and analysis requests and reports errors', asyn
   assert.equal(h.loading.value, false);
   assert.equal(h.testResult.value, '保存失败');
 });
-test('all AI configuration has one settings entry; voice page retains the shortcut and search', () => {
+test('AI configuration lives inside the voice page AI card; no separate settings entry', () => {
   const root = fs.readFileSync(new URL('../src/views/SettingsPage.vue', import.meta.url), 'utf8');
   const page = fs.readFileSync(new URL('../src/views/settings/AISettings.vue', import.meta.url), 'utf8');
   const voice = fs.readFileSync(new URL('../src/views/settings/VoiceSettings.vue', import.meta.url), 'utf8');
-  assert.match(root, /id: 'ai', title: 'AI 设置'/);
-  assert.doesNotMatch(root, /id: 'chat',/);
+  assert.doesNotMatch(root, /id: 'ai'/);
+  assert.doesNotMatch(root, /AISettings/);
   assert.match(page, /<AIModelSettings/);
   assert.match(page, /<ChatSettings/);
-  // Connectivity probe may reuse the shared endpoint (backend validates API connectivity there),
-  // but model-list/preset refresh logic must stay in the AI settings page: exactly one probe call is allowed.
+  assert.match(page, /<slot \/>/);
+  assert.match(voice, /<AISettings/);
+  const template = voice.slice(voice.indexOf('<template>'));
+  assert.ok(template.indexOf('setQAEnabled') > template.indexOf('<AISettings') && template.indexOf('setQAEnabled') < template.indexOf('</AISettings>'), 'QA takeover UI must live inside the AI card');
+  assert.doesNotMatch(voice, /打开 AI 设置/);
+  assert.doesNotMatch(voice, /settingsCategory = 'ai'/);
   assert.doesNotMatch(voice, /AI_PRESET_PROVIDERS|refreshModels/);
   assert.equal((voice.match(/\/voice-commands\/models/g) || []).length, 1, 'voice page probes connectivity exactly once');
-  assert.match(voice, /打开 AI 设置/);
   assert.match(voice, /external_search_playlist_id/);
 });
 test('analysis result is ignored after changing the model during the request', async () => {
