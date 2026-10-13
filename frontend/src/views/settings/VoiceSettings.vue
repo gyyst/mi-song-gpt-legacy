@@ -8,7 +8,7 @@ import SlInput from '../../ui/SlInput.vue';
 import SlSelect from '../../ui/SlSelect.vue';
 import SlSwitch from '../../ui/SlSwitch.vue';
 import VoiceSectionNav from './voice/VoiceSectionNav.vue';
-import { del, post, postLong, pluginWebSocketUrl } from '../../api';
+import { del, get, post, postLong, pluginWebSocketUrl } from '../../api';
 import { navigation } from '../../runtime';
 import {
   addWebhook,
@@ -214,10 +214,32 @@ const searchProviderOptions = computed(() =>
 
 syncSourceDrafts();
 
+const aiConnState = ref<'idle' | 'loading' | 'ok' | 'error'>('idle');
+const aiConnLatency = ref<number | null>(null);
+
+async function probeAiConnection(): Promise<void> {
+  const c = state.config.ai_config || {};
+  if (!c.api_url || !c.api_key) {
+    aiConnState.value = 'idle';
+    return;
+  }
+  aiConnState.value = 'loading';
+  const startedAt = Date.now();
+  try {
+    await get('/voice-commands/models');
+    aiConnLatency.value = Date.now() - startedAt;
+    aiConnState.value = 'ok';
+  } catch {
+    aiConnLatency.value = null;
+    aiConnState.value = 'error';
+  }
+}
+
 onMounted(async () => {
   await Promise.all([loadVoiceData(), loadSearchProviders()]);
   syncSourceDrafts();
   if (state.config.conversation_monitor_enabled) connectConversation();
+  void probeAiConnection();
 });
 onUnmounted(() => {
   conversationSocket?.close();
@@ -634,7 +656,7 @@ async function testQA(): Promise<void> {
 // --- 语音管线状态（对话监听卡状态栏 chips）---
 
 const aiPipelineText = computed(() => {
-  const c = state.config.ai_config;
+  const c = state.config.ai_config || {};
   if (!c.enabled) return 'AI判定 未启用';
   if (!c.api_url || !c.api_key) return 'AI判定 未配置';
   if (aiConnState.value === 'error') return 'AI判定 连接异常';
@@ -642,7 +664,7 @@ const aiPipelineText = computed(() => {
   return `AI判定 ${c.model || '未选模型'}`;
 });
 const aiPipelineChipClass = computed(() => {
-  const c = state.config.ai_config;
+  const c = state.config.ai_config || {};
   if (!c.enabled) return '';
   if (!c.api_url || !c.api_key || aiConnState.value === 'error') return 'chip-warning';
   return 'chip-success';

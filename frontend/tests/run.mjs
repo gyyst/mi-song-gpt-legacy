@@ -43,6 +43,9 @@ assert.ok(store.includes('export function upsertConversationMessage'), 'store �
 assert.ok(store.includes('state.conversationMessages = sortConversationDesc('), 'HTTP 轮询刷新必须过降序排序');
 assert.ok(voiceSettings.includes('state.conversationMessages = sortConversationDesc('), 'WS 快照帧必须过降序排序');
 assert.ok(voiceSettings.includes('upsertConversationMessage(state.conversationMessages, frame.data)'), 'WS 增量帧必须走 upsert（防重复 + 降序）');
+assert.ok(/const aiConnState = ref</.test(voiceSettings), 'VoiceSettings must declare aiConnState (AI pipeline chip source)');
+assert.ok(/const aiConnLatency = ref</.test(voiceSettings), 'VoiceSettings must declare aiConnLatency');
+assert.ok(voiceSettings.includes('void probeAiConnection()'), 'VoiceSettings must probe AI connection on mount');
 const speedPopup = read('views/PlayerSpeedPopup.vue');
 const toolboxSettings = read('views/settings/ToolboxSettings.vue');
 const volumePopup = read('views/PlayerVolumePopup.vue');

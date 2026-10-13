@@ -1708,3 +1708,36 @@ test('DLNA takeover invalidates pending voice analysis before it can replace the
     assert.deepEqual(calls, []); assert.equal(manager.isExternalPlayback(), true); dispatcher.close(); manager.cleanup();
   });
 });
+
+test('external resume poll ignores playing state without progress', async () => {
+  await withClock(async () => {
+    const tts = player({ service: { getPlayState: async () => ({ status: 1, position: 0, duration: 0, hasPosition: false }) } });
+    await tts.manager.stop();
+    for (let i = 0; i < 4; i++) await tts.manager.checkExternalResume();
+    assert.equal(tts.manager.state, 'stopped', 'TTS/progress-less playback must not trigger external resume takeover');
+
+    const stream = player({ service: { getPlayState: async () => ({ status: 1, position: 0, duration: 300, hasPosition: false }) } });
+    await stream.manager.stop();
+    await stream.manager.checkExternalResume();
+    assert.equal(stream.manager.state, 'stopped', 'single hit is not enough to take over');
+    await stream.manager.checkExternalResume();
+    assert.equal(stream.manager.state, 'playing', 'our own stream resuming must be taken over');
+    stream.manager.cleanup();
+  });
+});
+
+test('suppressing external resume detection blocks adoption until release', async () => {
+  await withClock(async () => {
+    const { manager } = player({ service: { getPlayState: async () => ({ status: 1, position: 45, duration: 300, hasPosition: true }) } });
+    await manager.stop();
+    manager.suppressExternalResume();
+    assert.equal(manager.resumePollTimer, null, 'poll timer must be cleared while suppressed');
+    for (let i = 0; i < 3; i++) await manager.checkExternalResume();
+    assert.equal(manager.state, 'stopped', 'no adoption while suppressed');
+    manager.releaseExternalResume();
+    await manager.checkExternalResume();
+    await manager.checkExternalResume();
+    assert.equal(manager.state, 'playing', 'genuine playback resume must be adopted after release');
+    manager.cleanup();
+  });
+});

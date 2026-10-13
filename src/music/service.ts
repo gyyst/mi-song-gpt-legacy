@@ -404,7 +404,11 @@ export class MusicCommandService {
       // 先挂起切歌定时器，防止 QA 等待原生回答/LLM 请求期间触发自动切歌
       pm.suspendForVoiceInteraction();
     }
-    const qa = await this.qaFallback.handle({ msg, query, accountId, aiResult, aiEnabled: aiConfig.enabled });
+    // While QA takes over the speaker is announcing TTS: suspend external resume detection so the progress-less status=1 cannot be mistaken for a resume and trigger auto-advance; release on completion (including throw).
+    pm?.suppressExternalResume();
+    const qa = await this.qaFallback
+      .handle({ msg, query, accountId, aiResult, aiEnabled: aiConfig.enabled })
+      .finally(() => pm?.releaseExternalResume());
     if (qa.elapsed?.native_ms !== undefined) {
       stages.push({ key: 'native', label: '小爱原生回答', ms: qa.elapsed.native_ms });
     }

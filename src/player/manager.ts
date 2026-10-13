@@ -343,6 +343,7 @@ export class PlaylistManager {
   private hourlyResumeCancelVersion: number = 0;
   private resumePollTimer: any = null;  // 定时器ID（后台探测外部恢复，见 EXTERNAL_RESUME_* 常量）
   private resumePollStartedAt: number = 0;
+  private externalResumeSuppressed = false;   // suspend external resume detection during voice takeover (QA etc.)
   private resumePollHits: number = 0;   // 连续探测到设备"在播放"的次数
   private durationProbeTimer: any = null; // 定时器ID（duration==0 时兜底切歌探测，见 DURATION_PROBE_* 常量）
   private maxProbePosition: number = 0;   // 循环回零探测：本轮见过的最大设备 position，用于判定是否回零
@@ -2943,9 +2944,22 @@ export class PlaylistManager {
     }
   }
 
+  // Voice takeover starts: suspend external resume detection so progress-less audio (TTS) is not mistaken for a resume.
+  suppressExternalResume(): void {
+    this.externalResumeSuppressed = true;
+    this.stopResumePoll();
+  }
+
+  // Voice takeover ends: resume detection; re-arm the poll if still stopped with songs queued.
+  releaseExternalResume(): void {
+    this.externalResumeSuppressed = false;
+    if (this.state === 'stopped' && this.songs.length > 0 && !this.externalPlayback) this.startResumePoll();
+  }
+
   private startResumePoll(): void {
     this.stopResumePoll();
     if (this.externalPlayback) return;
+    if (this.externalResumeSuppressed) return;
     if (this.songs.length === 0) return;
     this.resumePollStartedAt = Date.now();
     this.resumePollHits = 0;
@@ -2972,6 +2986,7 @@ export class PlaylistManager {
 
   private async checkExternalResume(): Promise<void> {
     if (this.state !== 'stopped' || this.songs.length === 0) return;
+    if (this.externalResumeSuppressed) return;
 
     if (Date.now() - this.resumePollStartedAt > EXTERNAL_RESUME_POLL_MAX_MS) {
       songloft.log.info('[PlaylistManager] Resume poll timed out, giving up');
@@ -2986,16 +3001,20 @@ export class PlaylistManager {
       if (status === 1) {
         // status=1 不足以接管：小爱在放它自己的内容时同样是 1，误判会在一个曲长后强推下一首
         // 把它打断（#408 那类「停了之后又自动播放」）。物理按键恢复的正常场景放的是我们的流，
-        // 'ours'/'unknown' 都放过，只挡明确认定被接管的 'foreign'。
-        if (this.matchDeviceStream(deviceState) === 'foreign') {
+        // 'ours' passes directly; 'unknown' only with real progress (position>0) - QA/TTS announcements are status=1 but progress-less and must not trigger takeover.
+        const match = this.matchDeviceStream(deviceState);
+        if (match === 'foreign') {
           songloft.log.info(`[PlaylistManager] Resume poll: device playing foreign media (deviceDuration=${deviceState.duration}s), not taking over`);
           this.resumePollHits = 0;
-        } else {
+        } else if (match === 'ours' || (deviceState.hasPosition && deviceState.position > 0)) {
           this.resumePollHits++;
           if (this.resumePollHits >= EXTERNAL_RESUME_CONFIRM_COUNT) {
             this.handleExternalResume(position);
             return;
           }
+        } else {
+          songloft.log.info(`[PlaylistManager] Resume poll: playing without progress (duration=${deviceState.duration}s), not taking over`);
+          this.resumePollHits = 0;
         }
       } else if (status >= 0) {
         this.resumePollHits = 0;

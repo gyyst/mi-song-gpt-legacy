@@ -134,7 +134,10 @@ test('all AI configuration has one settings entry; voice page retains the shortc
   assert.doesNotMatch(root, /id: 'chat',/);
   assert.match(page, /<AIModelSettings/);
   assert.match(page, /<ChatSettings/);
-  assert.doesNotMatch(voice, /\/voice-commands\/models|AI_PRESET_PROVIDERS/);
+  // Connectivity probe may reuse the shared endpoint (backend validates API connectivity there),
+  // but model-list/preset refresh logic must stay in the AI settings page: exactly one probe call is allowed.
+  assert.doesNotMatch(voice, /AI_PRESET_PROVIDERS|refreshModels/);
+  assert.equal((voice.match(/\/voice-commands\/models/g) || []).length, 1, 'voice page probes connectivity exactly once');
   assert.match(voice, /打开 AI 设置/);
   assert.match(voice, /external_search_playlist_id/);
 });
