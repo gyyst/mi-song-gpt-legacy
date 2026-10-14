@@ -34,7 +34,7 @@ export class MiIOClient {
    * xiaomusic 的 "5-3 你好" 形式等价于：
    * POST /miotspec/action { did, siid: 5, aiid: 3, in: ["你好"] }
    */
-  async textToSpeechByCommand(did: string, ttsCommand: string, text: string): Promise<boolean> {
+  async textToSpeechByCommand(did: string, ttsCommand: string, text: string, current?: () => boolean): Promise<boolean> {
     const [siid, aiid] = parseTTSCommand(ttsCommand);
     if (!did || siid <= 0 || aiid <= 0) {
       songloft.log.warn(`[MiIOClient] invalid TTS command did=${did || ''} command=${ttsCommand}`);
@@ -44,7 +44,8 @@ export class MiIOClient {
     const safeText = text.replace(/ /g, ',');
     songloft.log.info(`[MiIOClient] TTS command start did=${did} siid=${siid} aiid=${aiid} text_length=${text.length}`);
 
-    const result = await this.miotAction(did, siid, aiid, [safeText]);
+    const result = await this.miotAction(did, siid, aiid, [safeText], current);
+    if (result === null || current?.() === false) return false;
     const innerCode = result && typeof result === 'object' && 'code' in result
       ? Number((result as Record<string, unknown>).code)
       : 0;
@@ -58,7 +59,7 @@ export class MiIOClient {
     return ok;
   }
 
-  private async miotAction(did: string, siid: number, aiid: number, args: unknown[]): Promise<unknown | null> {
+  private async miotAction(did: string, siid: number, aiid: number, args: unknown[], current?: () => boolean): Promise<unknown | null> {
     return this.miioRequest('/miotspec/action', {
       params: {
         did,
@@ -66,10 +67,10 @@ export class MiIOClient {
         aiid,
         in: args,
       },
-    });
+    }, current);
   }
 
-  private async miioRequest(uri: string, data: unknown): Promise<unknown | null> {
+  private async miioRequest(uri: string, data: unknown, current?: () => boolean): Promise<unknown | null> {
     const service = this.tokenInfo.services[XIAOMI_IO_SID];
     if (!service || !service.service_token || !service.ssecurity) {
       songloft.log.warn('[MiIOClient] missing xiaomiio service token');
@@ -99,6 +100,7 @@ export class MiIOClient {
 
     let response;
     try {
+      if (current?.() === false) return null;
       response = await httpFetch(`${MIIO_API_BASE_URL}${uri}`, {
         method,
         headers,

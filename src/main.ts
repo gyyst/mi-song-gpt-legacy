@@ -1,4 +1,8 @@
-import { createRouter } from '@songloft/plugin-sdk';
+import { AIClient } from './ai/client';
+import { ChatMemoryService } from './chat/memory';
+import { VoiceDispatcher } from './voicecmd/dispatcher';
+import { chatBody, registerChatHandlers } from './handlers/chat';
+import { createRouter, parseQuery } from '@songloft/plugin-sdk';
 import type { HTTPRequest, HTTPResponse, WebSocketRequest, InboundWebSocket } from '@songloft/plugin-sdk';
 import { ConfigManager } from './config/manager';
 import { AccountManager } from './account/manager';
@@ -14,6 +18,7 @@ import { AIAnalyzer } from './voicecmd/ai_analyzer';
 import { getDefaultVoiceCommands } from './voicecmd/engine';
 import { IndexingManager } from './indexing/manager';
 import { MemoryService } from './memory';
+import { DLNAReceiver } from './receiver/receiver';
 
 // 导入所有handler注册函数
 import { registerAccountHandlers } from './handlers/account';
@@ -74,6 +79,9 @@ let conversationMonitor: ConversationMonitor;
 let voiceEngine: VoiceEngine;
 let indexingManager: IndexingManager;
 let memoryService: MemoryService;
+let dlnaReceiver: DLNAReceiver;
+let chatMemory: ChatMemoryService;
+let voiceDispatcher: VoiceDispatcher;
 
 async function onInit(): Promise<void> {
   songloft.log.info('mi-song-gpt 插件初始化...');
@@ -92,6 +100,8 @@ async function onInit(): Promise<void> {
   groupCoordinator = new GroupCoordinator(playlistManagerMap, minaService, configManager);
   // 加载分组快照，使 PlaylistManagerMap 能同步把分组设备解析到共享 manager（多房间共用一套播放列表）
   await playlistManagerMap.refreshGroups();
+  dlnaReceiver = new DLNAReceiver(configManager, minaService, playlistManagerMap);
+  await dlnaReceiver.init();
   memoryService = new MemoryService();
 
   // 注入状态推送依赖（WebSocket 订阅端点 /status/ws 使用）
@@ -111,7 +121,14 @@ async function onInit(): Promise<void> {
   conversationMonitor = new ConversationMonitor(accountManager, configManager);
   // 注入对话推送依赖（WebSocket 订阅端点 /conversation/ws 使用）
   initConversationStream(conversationMonitor);
-  voiceEngine = new VoiceEngine(configManager, accountManager, minaService, playlistManagerMap, indexingManager, new AIAnalyzer(), memoryService, groupCoordinator);
+  const aiClient = new AIClient();
+  // 用户记忆：摘要/事实提取的 LLM 请求走 AIClient（kind=summary/memory），与问答共用连接配置
+  chatMemory = new ChatMemoryService((connection, messages, kind) => aiClient.request(connection, messages, kind));
+  voiceEngine = new VoiceEngine(configManager, accountManager, minaService, playlistManagerMap, indexingManager, new AIAnalyzer((run, current, scope) => aiClient.foregroundRequest(run, current, scope)), memoryService, groupCoordinator, chatMemory, aiClient);
+
+  voiceDispatcher = new VoiceDispatcher(voiceEngine, playlistManagerMap);
+  // mina 控制被更新的操作抢占时（如 DLNA 接管），作废该设备仍在途的语音分析
+  minaService.setOnControl((account, device) => voiceDispatcher.invalidateDevice(account, device));
 
   const executor = new TaskExecutor(configManager, accountManager, minaService, playlistManagerMap, indexingManager, conversationMonitor, groupCoordinator, voiceEngine);
   scheduler = new Scheduler(configManager, executor);
@@ -141,7 +158,8 @@ async function onInit(): Promise<void> {
   registerConfigHandlers(router, configManager, conversationMonitor, scheduler, voiceEngine, memoryService);
   registerConversationHandlers(router, conversationMonitor, configManager);
   registerScheduleHandlers(router, scheduler, configManager);
-  registerVoiceCommandHandlers(router, configManager, accountManager, voiceEngine);
+  registerVoiceCommandHandlers(router, configManager, accountManager, voiceEngine, voiceDispatcher);
+  registerChatHandlers(router, configManager, chatMemory);
   registerIndexingHandlers(router, indexingManager);
   registerMemoryHandlers(router, memoryService, configManager);
   registerLyricHandlers(router);
@@ -174,7 +192,7 @@ async function onInit(): Promise<void> {
 
   // 注册 VoiceEngine 回调（独立于启停生命周期）
   conversationMonitor.registerCallback('voice_engine', (msg) => {
-    return voiceEngine.handleMessage(msg);
+    voiceDispatcher.submit(msg);
   });
 
   // 根据配置启动后台服务
@@ -195,6 +213,10 @@ async function onInit(): Promise<void> {
 
 async function onDeinit(): Promise<void> {
   songloft.log.info('mi-song-gpt 插件停止...');
+  voiceDispatcher?.close();
+  chatMemory?.close();
+  voiceEngine?.close();
+  await dlnaReceiver?.close();
   scheduler?.stop();
   conversationMonitor?.stop();
   playlistManagerMap?.cleanup();
@@ -209,7 +231,7 @@ async function onDeinit(): Promise<void> {
 // 直接返回对象会变成 Go 的 map 文本（map[busy:true ...]），后端解析不出来。
 async function onQueryBusy(): Promise<string> {
   try {
-    const reason = playlistManagerMap?.busyReason() ?? '';
+    const reason = voiceEngine?.busyReason() || dlnaReceiver?.busyReason() || playlistManagerMap?.busyReason() || '';
     return JSON.stringify({ busy: reason !== '', reason });
   } catch (e) {
     // 探测本身出错时按空闲处理，不能因为探测失败就永久阻塞更新
@@ -219,6 +241,11 @@ async function onQueryBusy(): Promise<string> {
 }
 
 async function onHTTPRequest(req: HTTPRequest): Promise<HTTPResponse> {
+  if (req.method !== 'GET' && (req.path.startsWith('/player/') || req.path.startsWith('/mina/') || req.path.startsWith('/dlna/'))) {
+    try { const input = { ...parseQuery(req.query), ...chatBody(req) }; if (typeof input.account_id === 'string' && typeof input.device_id === 'string') voiceDispatcher.invalidateDevice(input.account_id, input.device_id); } catch { }
+  }
+  if (req.path === '/receiver/config' || req.path.startsWith('/dlna/')) return dlnaReceiver.handle(req);
+  if (req.method !== 'GET' && (req.path.startsWith('/groups') || req.path.startsWith('/account') || req.path === '/config' || req.path.includes('/managed'))) { voiceDispatcher.invalidate(); }
   return await router.handle(req);
 }
 

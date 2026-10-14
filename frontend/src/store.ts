@@ -27,7 +27,7 @@ const defaultConfig: MiotConfig = {
   server_host_status: 'empty',
   suggested_addresses: [],
   conversation_monitor_enabled: false,
-  conversation_poll_interval: 1,
+  conversation_poll_interval: 2,
   debug_log_enabled: false,
   voice_command_enabled: false,
   voice_memory_enabled: true,
@@ -58,6 +58,7 @@ const defaultConfig: MiotConfig = {
   play_announcement_delay: 3,
   play_announcement_scope: 'voice',
   smart_resume_timeout: 30,
+  hourly_chime_resume_enabled: false,
   default_cover_id: '',
   touchscreen_lyrics_enabled: false,
   ai_config: {},
@@ -256,8 +257,8 @@ export async function removeSongFromPlaylist(song: Song, opts: { fromLibrary?: b
 
 export async function loadConfig(): Promise<void> {
   const config = await get<MiotConfig>('/config');
-  // Normalize nullable fields before touching the reactive object. WebF can render
-  // between individual assignments, so never expose transient null arrays.
+  // Normalize nullable fields before touching the reactive object: never expose
+  // transient null arrays (reactivity can render between individual assignments).
   const normalized: MiotConfig = {
     ...defaultConfig,
     ...(config || {}),
@@ -577,6 +578,7 @@ export async function refreshPlayerStatus(): Promise<void> {
   if (!state.currentAccountId || !state.currentDeviceId) return;
   if (statusRequestBusy) return;
   statusRequestBusy = true;
+  const generation = statusRequestGeneration;
   try {
     const status = await get<PlayerStatus>(
       `/player/status${query({
@@ -584,11 +586,13 @@ export async function refreshPlayerStatus(): Promise<void> {
         device_id: state.currentDeviceId,
       })}`,
     );
-    applyPlayerStatus(status);
+    if (generation === statusRequestGeneration) applyPlayerStatus(status);
   } catch (error) {
-    if (!state.statusConnected) console.warn('[miot] status refresh failed', messageOf(error));
+    if (generation === statusRequestGeneration && !state.statusConnected) {
+      console.warn('[miot] status refresh failed', messageOf(error));
+    }
   } finally {
-    statusRequestBusy = false;
+    if (generation === statusRequestGeneration) statusRequestBusy = false;
   }
 }
 
@@ -609,23 +613,38 @@ let statusOpenTimer: ReturnType<typeof setTimeout> | null = null;
 let statusAttempts = 0;
 let statusManualClose = false;
 let statusRequestBusy = false;
+// 恢复、切设备或卸载后，旧 HTTP 请求的结果和 finally 都不能影响新一轮请求。
+let statusRequestGeneration = 0;
 // 每次开连自增。一次断线可能同时打到 onerror 和 onclose，用它保证回收只做一遍，
 // 免得重连退避的 statusAttempts 被多加一次。
 let statusSocketGen = 0;
 
-// close 必须带关闭码。webf 0.24.27 的 websocket.dart:145 派发 close 事件时写的是
-// `client.closeCode!`，而本地 close 不带码时 dart:io 会把它留成 null
-// （websocket_impl.dart:1362 只赋传入的 code，1375 那个「5 秒等不到对端 close 帧」
-// 的兜底再把 null 抄给 closeCode），弱网断线于是抛 Null check operator used on a
-// null value。它抛在 _listen 的 onDone 里，后面派发 close 事件和清 map 的代码全部
-// 跳过 —— JS 侧 onclose 永不触发，既不重连也不回落轮询，状态流静默停更
-// （songloft-org/songloft-plugin-miot#96 第 4 条日志里那两次 PlatformError）。
-// 带上码之后 closeCode 的三条赋值路径就都非空了。
+// close 必须带关闭码：本地 close 不带码时，部分实现会把 closeCode 留成 null 并在
+// 派发 close 事件时抛空指针，导致 onclose 永不触发、状态流静默停更
+// （songloft-org/songloft-plugin-miot#96）。带上码之后各条赋值路径都非空了。
 const STATUS_CLOSE_CODE = 1000;
 const STATUS_CLOSE_REASON = 'client';
 // 开连后这么久还没 onopen 就先把轮询顶上，别让「连不上」等于「没状态」。
 // 真连上时 onopen 会把轮询清掉。
 const STATUS_OPEN_TIMEOUT_MS = 8000;
+
+function resetStatusRequests(): void {
+  statusRequestGeneration += 1;
+  statusRequestBusy = false;
+}
+
+function resumeStatusStream(): void {
+  if (document.hidden || statusManualClose || !state.currentAccountId || !state.currentDeviceId) return;
+  // 后台断网可能留下 readyState=OPEN 的旧连接，且不触发 error/close。
+  // 恢复可见或网络恢复时主动换连接，HTTP 快照不必等待握手完成（songloft-org/songloft#493）。
+  if (statusReconnect) clearTimeout(statusReconnect);
+  statusReconnect = null;
+  statusAttempts = 0;
+  resetStatusRequests();
+  abandonStatusSocket(statusSocketGen, false);
+  openStatusSocket();
+  void refreshPlayerStatus();
+}
 
 function startStatusPolling() {
   if (statusPoll) return;
@@ -656,9 +675,8 @@ function abandonStatusSocket(gen: number, recover: boolean) {
   const socket = statusSocket;
   statusSocket = null;
   state.statusConnected = false;
-  // 读实例上的常量，不读 `WebSocket.CLOSED`：WebF 的 WebSocket 是 JS polyfill
-  // （webf `bridge/polyfill/src/websocket.ts`），四个 readyState 常量只在构造函数里
-  // 挂到实例上，类上**没有**静态同名成员，`WebSocket.CLOSED` 在 WebF 里是 undefined。
+  // 读实例上的常量，不读 `WebSocket.CLOSED`：部分宿主环境的 WebSocket 实现只在
+  // 构造函数里把 readyState 常量挂到实例上、类上没有静态同名成员。
   if (socket && socket.readyState !== socket.CLOSED) {
     try {
       socket.close(STATUS_CLOSE_CODE, STATUS_CLOSE_REASON);
@@ -705,10 +723,9 @@ function openStatusSocket() {
         // Ignore malformed frames; the next valid status replaces them.
       }
     };
-    // 恢复动作必须在 onerror 里自己做完，不能像旧写法那样 `close()` 一下等 onclose 收尾：
-    // WebF 的连接失败只发 error、不发 close（真实浏览器两者都发，close 才是恢复入口），
-    // 而那一下 close() 落到 webf 的「has not connect」分支，不产生任何事件 ——
-    // 于是 onclose 永不触发，既不重连也不回落轮询，状态永久停在最后一帧。
+    // 恢复动作必须在 onerror 里自己做完，不能 `close()` 一下等 onclose 收尾：
+    // 部分实现的连接失败只发 error、不发 close，close() 也可能落在「未连接」分支
+    // 不产生任何事件 —— 于是 onclose 永不触发，既不重连也不回落轮询。
     statusSocket.onerror = () => abandonStatusSocket(gen, true);
     statusSocket.onclose = () => abandonStatusSocket(gen, true);
     clearStatusOpenTimer();
@@ -726,12 +743,13 @@ export function connectStatusStream(): void {
   disconnectStatusStream();
   statusManualClose = false;
   statusAttempts = 0;
+  document.addEventListener('visibilitychange', resumeStatusStream);
+  window.addEventListener('online', resumeStatusStream);
   openStatusSocket();
 }
 
 export function requestStatusRefresh(): void {
-  // 同上：`WebSocket.OPEN` 在 WebF 里是 undefined，旧写法拿它比对 readyState 恒为 false
-  // —— 这条「让服务端立刻推一帧状态」的请求在客户端里从来没发出去过。
+  // 同上：读实例上的常量比对 readyState，类上的静态成员在部分宿主环境是 undefined。
   if (statusSocket && statusSocket.readyState === statusSocket.OPEN) {
     statusSocket.send(JSON.stringify({ type: 'refresh' }));
   }
@@ -739,6 +757,9 @@ export function requestStatusRefresh(): void {
 
 export function disconnectStatusStream(): void {
   statusManualClose = true;
+  document.removeEventListener('visibilitychange', resumeStatusStream);
+  window.removeEventListener('online', resumeStatusStream);
+  resetStatusRequests();
   if (statusReconnect) clearTimeout(statusReconnect);
   if (statusPoll) clearInterval(statusPoll);
   statusReconnect = null;
@@ -811,9 +832,29 @@ export async function saveVoiceCommands(commands = state.voiceCommands): Promise
   notify('语音口令已保存', 'success');
 }
 
+/**
+ * 最近对话记录统一按时间降序。WS 增量帧的到达顺序不可靠（同批多条时 unshift 会把
+ * 顺序翻转），所有入口（快照/增量/轮询刷新）赋值前都过这里，顺序永远与到达无关（mi-song-gpt）。
+ */
+export function sortConversationDesc(list: ConversationMessage[]): ConversationMessage[] {
+  return [...list].sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+}
+
+/**
+ * 按 id upsert：outcome 补推帧替换原条目（不产生重复），真正的新消息插到顶部，
+ * 最后统一降序（mi-song-gpt）。
+ */
+export function upsertConversationMessage(list: ConversationMessage[], item: ConversationMessage): ConversationMessage[] {
+  const idx = item.id ? list.findIndex(m => m.id === item.id) : -1;
+  if (idx >= 0) list.splice(idx, 1, item);
+  else list.unshift(item);
+  return sortConversationDesc(list);
+}
+
 export async function loadConversationMessages(): Promise<void> {
-  state.conversationMessages =
-    (await get<ConversationMessage[]>('/conversation/messages?limit=50')) || [];
+  state.conversationMessages = sortConversationDesc(
+    (await get<ConversationMessage[]>('/conversation/messages?limit=50')) || [],
+  );
 }
 
 export async function addWebhook(name: string, url: string): Promise<void> {

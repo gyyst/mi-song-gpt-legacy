@@ -1,21 +1,25 @@
-// MIoT 智能音箱插件 - QA 问答接管（mi-song-gpt 新增）
+// MIoT 智能音箱插件 - QA 问答接管（mi-song-gpt）
 //
-// 与上游 songloft-plugin-miot 的差异：原插件在「固定口令 → 语音记忆 → 搜索规则 → AI 播放意图」
-// 全部未命中时直接把话语权交还小爱；本模块在该位置插入一层"问答接管"：
-//
-//   1. 等待/读取小爱对这句话的原生回答（云端对话记录的 content 字段）；
-//   2. 回答有效（未命中兜底话术正则）→ 不打扰，让小爱自己的回答播完；
+// 语音链路（在上游「固定口令 → 语音记忆 → 搜索规则 → AI 播放意图」全部未命中后）：
+//   1. 追问窗口内（距上一轮回答 followup_seconds 秒）直接由大模型接，跳过小爱闸门；
+//   2. 否则等待/读取小爱的原生回答，回答有效（未命中兜底话术）→ 不打扰；
 //   3. 回答命中兜底话术或超时无回答 → 打断小爱 → 播"正在思考"占位 →
-//      调用问答大模型（可选火山方舟 Responses API 联网搜索）→ TTS 分段播报 → 记录对话历史。
+//      调用问答大模型（可选火山方舟 Responses API 联网搜索）→ TTS 分段播报。
 //
-// 判定与问答分离：播放意图判定用 ai_config（快而便宜的小模型），问答用 qa_config（强模型）。
+// 上下文与记忆：LLM 消息经 ChatMemoryService 组装（人设 + 摘要/长期记忆 + 近期轮次），
+// 问答完成写回记忆并触发后台摘要/事实提取——「越用越懂用户」。判定与问答分离：
+// 播放意图判定用 ai_config（快而便宜的小模型），问答用 qa_config（强模型，唯一问答连接）。
 
 /// <reference types="@songloft/plugin-sdk" />
 
 import type { ConfigManager } from '../config/manager';
 import type { MinaService } from '../service/service';
-import type { AIAnalysisResult, AskMessage, ConversationMessage, QAConfig } from '../types';
-import { aiChatCompletionsUrl, aiResponsesUrl, maskUrl } from '../utils/ai_url';
+import type { AIClient, AIMessage } from '../ai/client';
+import { ChatMemoryService, accountScope, qaConnection } from '../chat/memory';
+import type { ChatSnapshot, ChatTurn } from '../chat/memory';
+import type { AIAnalysisResult, AIConfig, AskMessage, ConversationMessage, QAConfig } from '../types';
+import { aiResponsesUrl, maskUrl } from '../utils/ai_url';
+import { requestAI } from '../utils/ai_request';
 
 // ===== 类型 =====
 
@@ -45,15 +49,9 @@ export interface QATestResult {
   elapsed_ms: number;
 }
 
-type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
-
 // ===== 常量 =====
 
-const HISTORY_STORAGE_KEY = 'qa_history';
 const DEFAULT_SYSTEM_PROMPT = '你是一个智能音箱助手，请用简洁的口语回答用户的问题，每次回答控制在150字以内，不要使用 markdown、列表和特殊符号。';
-
-/** 每设备最多保留的对话轮数（防御性上限，与前端输入范围一致） */
-const HISTORY_MAX_ROUNDS = 20;
 
 /**
  * 小爱"答不上来"的兜底话术正则（移植自 migpt-next 实战配置，并补充音乐场景）：
@@ -66,7 +64,8 @@ const XIAOAI_ANSWER_FAILURE_RE = new RegExp(
   '|被难住了(?:诶|呢|呀|哦)?|暂(?:时)?不支持(?:该|此)?功能|不知道咋说' +
   '|还.{0,4}(?:支持.{0,6}功能|学习)|不如换.{0,6}(?:方式|问题|说)' +
   '|超出.{0,6}(?:能力|范围)|(?:没有|无法)找到.{0,8}(?:答案|结果|内容|歌曲|音乐|歌)' +
-  '|(?:暂时|还)回答不)',
+  '|(?:暂时|还)回答不' +
+  '|(?:我的)?盲区|(?:加紧|要去|再去)学习)',
   'i',
 );
 
@@ -91,14 +90,23 @@ export function isXiaoAIAnswerFailure(text: string): boolean {
 export class QAFallback {
   private configManager: ConfigManager;
   private minaService: MinaService;
-  /** 对话历史缓存：Promise 表示 in-flight 加载（与 ConfigManager 同约定） */
-  private historyCache: Promise<Record<string, ChatMessage[]>> | null = null;
-  /** 每设备请求序号：新语音到达时旧请求的 TTS 作废，防止抢话 */
+  private memory: ChatMemoryService;
+  private client: AIClient;
+  /** 每账号请求序号：新语音到达时旧请求的 TTS 作废，防止抢话 */
   private requestSeq = new Map<string, number>();
+  /** 在飞接管数（含原生闸门等待），供热更新忙碌探测 */
+  private inFlight = 0;
 
-  constructor(configManager: ConfigManager, minaService: MinaService) {
+  constructor(configManager: ConfigManager, minaService: MinaService, memory: ChatMemoryService, client: AIClient) {
     this.configManager = configManager;
     this.minaService = minaService;
+    this.memory = memory;
+    this.client = client;
+  }
+
+  /** 是否有问答接管在进行中（热更新前忙碌探测用） */
+  isBusy(): boolean {
+    return this.inFlight > 0;
   }
 
   /**
@@ -113,7 +121,7 @@ export class QAFallback {
 
     const { msg, query, accountId } = input;
     const deviceId = msg.device_id;
-    const scope = accountId + ':' + deviceId;
+    const scope = accountScope(accountId);
 
     // 触发条件：判定器不可用（未启用/失败/未产生音乐动作），或判定结果为 qa/unknown/低置信。
     // 能走到这里的消息必然没有执行任何音乐操作（engine 保证），所以只需排除
@@ -127,83 +135,131 @@ export class QAFallback {
       }
     }
 
-    // 1) 读取/等待小爱原生回答（计时回传，UI「最近对话记录」meta 行显示）
-    const nativeStart = Date.now();
-    const native = await this.waitForNativeAnswer(msg, accountId, deviceId, cfg);
-    const nativeMs = Date.now() - nativeStart;
-    if (native && !isXiaoAIAnswerFailure(native)) {
-      songloft.log.info(`[QA] keep native answer: ${native.slice(0, 80)}`);
-      return { handled: false, outcome: 'answered_by_xiaoai', answer: native, elapsed: { native_ms: nativeMs } };
-    }
-    if (native) {
-      songloft.log.info(`[QA] native answer hit fallback phrase: ${native.slice(0, 80)}`);
-    } else {
-      songloft.log.info('[QA] no native answer within wait window, taking over');
-    }
-
-    // 2) 大模型接管：打断小爱 → 占位提示 → 请求（可联网）→ TTS
-    const seq = (this.requestSeq.get(scope) || 0) + 1;
-    this.requestSeq.set(scope, seq);
-
+    this.inFlight++;
     try {
-      await this.minaService.stopPlay(accountId, deviceId);
-    } catch (e) {
-      songloft.log.warn(`[QA] failed to interrupt speaker: ${String(e)}`);
-    }
-    if (cfg.thinking_notice) {
+      // 记忆快照：损坏时降级为无上下文，不阻断接管
+      let snapshot: ChatSnapshot | null = null;
       try {
-        await new Promise(resolve => setTimeout(resolve, 300));
-        await this.minaService.textToSpeech(accountId, deviceId, cfg.thinking_notice);
-      } catch (e) {
-        songloft.log.warn(`[QA] failed to play thinking notice: ${String(e)}`);
+        snapshot = await this.memory.load(scope);
       }
-    }
+      catch (e) {
+        songloft.log.warn(`[QA] memory load failed, answering without context: ${String(e)}`);
+      }
 
-    const started = Date.now();
-    const useSearch = cfg.web_search_enabled
-      && (cfg.web_search_strategy === 'auto' || FRESHNESS_RE.test(query));
-    let answer = '';
-    let attemptedSearch = false;
-    if (useSearch) {
-      attemptedSearch = true;
-      try {
-        answer = await this.callResponsesSearch(cfg, scope, query);
-      } catch (e) {
-        songloft.log.warn(`[QA] web search failed: ${String(e)}`);
-        answer = '';
-      }
-    }
-    if (!answer) {
-      try {
-        answer = await this.callChatLLM(cfg, scope, query, true);
-        if (answer && attemptedSearch && cfg.web_search_fallback_notice) {
-          answer = cfg.web_search_fallback_notice + answer;
+      // 追问窗口：距上一轮完成回答 N 秒内视为追问，跳过小爱原生闸门直接由大模型接。
+      // 窗口状态从记忆推导（最近一轮 completed 的时间戳），无需独立路由。
+      const completed = snapshot ? snapshot.history.filter(t => t.phase === 'completed') : [];
+      const lastTurn = completed[completed.length - 1];
+      const inFollowup = cfg.followup_seconds > 0 && !!lastTurn && (Date.now() - lastTurn.created_at) < cfg.followup_seconds * 1000;
+
+      // 1) 小爱原生回答闸门（追问窗口内跳过——上下文在我们手里，交给同一个大脑接）
+      let nativeMs: number | undefined;
+      if (!inFollowup) {
+        const nativeStart = Date.now();
+        const native = await this.waitForNativeAnswer(msg, accountId, deviceId, cfg);
+        nativeMs = Date.now() - nativeStart;
+        if (native && !isXiaoAIAnswerFailure(native)) {
+          songloft.log.info(`[QA] keep native answer: ${native.slice(0, 80)}`);
+          return { handled: false, outcome: 'answered_by_xiaoai', answer: native, elapsed: { native_ms: nativeMs } };
         }
-      } catch (e) {
-        songloft.log.warn(`[QA] chat completions failed: ${String(e)}`);
-        answer = '';
+        if (native) {
+          songloft.log.info(`[QA] native answer hit fallback phrase: ${native.slice(0, 80)}`);
+        } else {
+          songloft.log.info('[QA] no native answer within wait window, taking over');
+        }
+      } else {
+        songloft.log.info('[QA] followup window open, skipping native gate');
       }
-    }
-    const llmMs = Date.now() - started;
-    songloft.log.info(`[QA] llm done in ${llmMs}ms search=${attemptedSearch} len=${answer.length}`);
 
-    const elapsed = { native_ms: nativeMs, llm_ms: llmMs };
-    if (!answer) {
-      return { handled: false, outcome: 'llm_failed', note: 'LLM returned empty, leaving speaker as is', elapsed };
-    }
-    if ((this.requestSeq.get(scope) || 0) !== seq) {
-      songloft.log.info('[QA] request superseded by newer voice input, skip TTS');
-      return { handled: true, outcome: 'answered_by_llm', answer, note: 'superseded, TTS skipped', elapsed };
-    }
+      // 2) 大模型接管：打断小爱 → 占位提示 → 请求（可联网）→ TTS → 记忆
+      const seq = (this.requestSeq.get(scope) || 0) + 1;
+      this.requestSeq.set(scope, seq);
 
-    await this.speakAnswer(accountId, deviceId, answer, cfg);
-    await this.appendHistory(scope, query, answer, cfg);
+      try {
+        await this.minaService.stopPlay(accountId, deviceId);
+      } catch (e) {
+        songloft.log.warn(`[QA] failed to interrupt speaker: ${String(e)}`);
+      }
+      if (cfg.thinking_notice) {
+        try {
+          await new Promise(resolve => setTimeout(resolve, 300));
+          await this.minaService.textToSpeech(accountId, deviceId, cfg.thinking_notice);
+        } catch (e) {
+          songloft.log.warn(`[QA] failed to play thinking notice: ${String(e)}`);
+        }
+      }
 
-    return { handled: true, outcome: 'answered_by_llm', answer, note: attemptedSearch ? 'web_search' : 'chat', elapsed };
+      const started = Date.now();
+      const messages: AIMessage[] = snapshot
+        ? this.memory.messages(snapshot, cfg, query)
+        : [{ role: 'system', content: (cfg.system_prompt || DEFAULT_SYSTEM_PROMPT).trim() }, { role: 'user', content: query }];
+      const connection = qaConnection(cfg);
+      const useSearch = cfg.web_search_enabled
+        && (cfg.web_search_strategy === 'auto' || FRESHNESS_RE.test(query));
+      let answer = '';
+      let attemptedSearch = false;
+      if (useSearch) {
+        attemptedSearch = true;
+        try {
+          answer = await this.callResponsesSearch(connection, messages);
+        } catch (e) {
+          songloft.log.warn(`[QA] web search failed: ${String(e)}`);
+          answer = '';
+        }
+      }
+      if (!answer) {
+        try {
+          answer = QAFallback.sanitizeForTTS(await this.client.request(connection, messages, 'chat', () => true, scope));
+          if (answer && attemptedSearch && cfg.web_search_fallback_notice) {
+            answer = cfg.web_search_fallback_notice + answer;
+          }
+        } catch (e) {
+          songloft.log.warn(`[QA] chat completions failed: ${String(e)}`);
+          answer = '';
+        }
+      }
+      const llmMs = Date.now() - started;
+      songloft.log.info(`[QA] llm done in ${llmMs}ms search=${attemptedSearch} len=${answer.length}`);
+
+      const elapsed: { native_ms?: number; llm_ms?: number } = { llm_ms: llmMs };
+      if (nativeMs !== undefined) elapsed.native_ms = nativeMs;
+      if (!answer) {
+        return { handled: false, outcome: 'llm_failed', note: 'LLM returned empty, leaving speaker as is', elapsed };
+      }
+      if ((this.requestSeq.get(scope) || 0) !== seq) {
+        songloft.log.info('[QA] request superseded by newer voice input, skip TTS');
+        return { handled: true, outcome: 'answered_by_llm', answer, note: 'superseded, TTS skipped', elapsed };
+      }
+
+      await this.speakAnswer(accountId, deviceId, answer, cfg);
+      // 记录该轮对话并触发后台摘要/事实提取；失败不影响已播回答
+      void this.recordTurn(scope, query, answer, cfg, connection);
+
+      return { handled: true, outcome: 'answered_by_llm', answer, note: attemptedSearch ? 'web_search' : 'chat', elapsed };
+    }
+    finally {
+      this.inFlight--;
+    }
+  }
+
+  /** 写回记忆 + 后台维护（fire-and-forget，由调用方 void 调用） */
+  private async recordTurn(scope: string, query: string, answer: string, cfg: QAConfig, connection: AIConfig): Promise<void> {
+    const turn: ChatTurn = { id: `qa-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`, user: query, assistant: answer, phase: 'completed', created_at: Date.now() };
+    try {
+      await this.memory.saveTurn(scope, turn, cfg);
+    } catch (e) {
+      songloft.log.warn(`[QA] failed to record turn: ${String(e)}`);
+      return;
+    }
+    try {
+      await this.memory.maintain(scope, connection, cfg);
+    } catch (e) {
+      songloft.log.warn(`[QA] memory maintain failed: ${String(e)}`);
+    }
   }
 
   /**
-   * 问答测试（设置页"问答测试"按钮）：不走原生回答检查、不打断音箱、不写历史，
+   * 问答测试（设置页"问答测试"按钮）：不走原生回答检查、不打断音箱、不写记忆，
    * 只验证问答链路（含联网搜索降级）并返回文本结果。
    */
   async testQA(query: string): Promise<QATestResult> {
@@ -213,6 +269,11 @@ export class QAFallback {
     }
     const q = query.trim();
     const started = Date.now();
+    const messages: AIMessage[] = [
+      { role: 'system', content: (cfg.system_prompt || DEFAULT_SYSTEM_PROMPT).trim() },
+      { role: 'user', content: q },
+    ];
+    const connection = qaConnection(cfg);
     const useSearch = cfg.web_search_enabled
       && (cfg.web_search_strategy === 'auto' || FRESHNESS_RE.test(q));
     let answer = '';
@@ -220,14 +281,14 @@ export class QAFallback {
     if (useSearch) {
       usedSearch = true;
       try {
-        answer = await this.callResponsesSearch(cfg, 'test', q);
+        answer = await this.callResponsesSearch(connection, messages);
       } catch (e) {
         songloft.log.warn(`[QA] test search failed: ${String(e)}`);
         answer = '';
       }
     }
     if (!answer) {
-      answer = await this.callChatLLM(cfg, 'test', q, false);
+      answer = QAFallback.sanitizeForTTS(await this.client.request(connection, messages, 'chat', () => true, 'test'));
       if (answer && usedSearch && cfg.web_search_fallback_notice) {
         answer = cfg.web_search_fallback_notice + answer;
       }
@@ -295,60 +356,36 @@ export class QAFallback {
 
   // ===== LLM =====
 
-  /** 组装消息数组：system + 历史 + 当前提问 */
-  private async buildMessages(cfg: QAConfig, scope: string, query: string, withHistory: boolean): Promise<ChatMessage[]> {
-    const messages: ChatMessage[] = [];
-    const system = (cfg.system_prompt || DEFAULT_SYSTEM_PROMPT).trim();
-    if (system) {
-      messages.push({ role: 'system', content: system });
-    }
-    if (withHistory && cfg.history_max_length > 0) {
-      const history = await this.getHistory(scope, cfg);
-      messages.push(...history);
-    }
-    messages.push({ role: 'user', content: query });
-    return messages;
-  }
-
-  /** 普通对话：POST /chat/completions（非流式） */
-  private async callChatLLM(cfg: QAConfig, scope: string, query: string, withHistory: boolean): Promise<string> {
-    const messages = await this.buildMessages(cfg, scope, query, withHistory);
-    const endpoint = aiChatCompletionsUrl(cfg.api_url);
-    songloft.log.info(`[QA] chat → ${maskUrl(endpoint)} model=${cfg.model} msgs=${messages.length}`);
-    const body = {
-      model: cfg.model,
-      messages,
-      temperature: 0.7,
-      max_tokens: 600,
-      stream: false,
-    };
-    const data = await this.postJSON(endpoint, body, cfg.api_key, cfg.timeout);
-    const content = data?.choices?.[0]?.message?.content;
-    const cleaned = QAFallback.sanitizeForTTS(typeof content === 'string' ? content : '');
-    if (!cleaned) {
-      throw new Error('empty answer');
-    }
-    return cleaned;
-  }
-
   /**
    * 联网对话：POST /responses + web_search 工具（火山方舟需在控制台开通"联网搜索"插件）。
    * 失败抛异常，由调用方降级为普通对话。
    */
-  private async callResponsesSearch(cfg: QAConfig, scope: string, query: string): Promise<string> {
-    const messages = await this.buildMessages(cfg, scope, query, true);
-    const endpoint = aiResponsesUrl(cfg.api_url);
+  private async callResponsesSearch(connection: AIConfig, messages: AIMessage[]): Promise<string> {
+    const endpoint = aiResponsesUrl(connection.api_url);
     if (!endpoint) {
       throw new Error('invalid api_url');
     }
-    songloft.log.info(`[QA] responses(web_search) → ${maskUrl(endpoint)} model=${cfg.model}`);
+    songloft.log.info(`[QA] responses(web_search) → ${maskUrl(endpoint)} model=${connection.model}`);
     const body = {
-      model: cfg.model,
+      model: connection.model,
       input: messages,
       tools: [{ type: 'web_search' }],
       stream: false,
     };
-    const data = await this.postJSON(endpoint, body, cfg.api_key, cfg.timeout);
+    const data = await requestAI(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${connection.api_key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    }, connection.timeout, { kind: 'chat', model: connection.model }, async (response) => {
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`API error ${response.status}: ${text.slice(0, 200)}`);
+      }
+      return await response.json();
+    });
     let text = '';
     const output = data?.output;
     if (Array.isArray(output)) {
@@ -370,30 +407,6 @@ export class QAFallback {
       throw new Error('empty search answer');
     }
     return cleaned;
-  }
-
-  /** 带 JSON 解析与超时的 POST */
-  private async postJSON(endpoint: string, body: unknown, apiKey: string, timeoutSec: number): Promise<any> {
-    const fetchPromise = fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('QA API call timed out')), Math.max(1, timeoutSec) * 1000);
-    });
-    const resp = await Promise.race([fetchPromise, timeoutPromise]) as Response;
-    if (!resp || typeof resp.ok !== 'boolean' || typeof resp.status !== 'number') {
-      throw new Error('invalid response object');
-    }
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => '');
-      throw new Error(`API error ${resp.status}: ${text.slice(0, 200)}`);
-    }
-    return await resp.json();
   }
 
   // ===== 文本处理 =====
@@ -471,59 +484,6 @@ export class QAFallback {
       } catch (e) {
         songloft.log.warn(`[QA] TTS segment ${i + 1}/${segments.length} error: ${String(e)}`);
       }
-    }
-  }
-
-  // ===== 对话历史 =====
-
-  private async loadHistory(): Promise<Record<string, ChatMessage[]>> {
-    if (this.historyCache === null) {
-      let raw: string | null = null;
-      try {
-        raw = (await songloft.storage.get(HISTORY_STORAGE_KEY)) as string | null;
-      } catch {
-        raw = null;
-      }
-      let parsed: Record<string, ChatMessage[]> = {};
-      if (raw) {
-        try {
-          parsed = JSON.parse(raw) as Record<string, ChatMessage[]>;
-        } catch {
-          parsed = {};
-        }
-      }
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        parsed = {};
-      }
-      this.historyCache = Promise.resolve(parsed);
-    }
-    return this.historyCache;
-  }
-
-  private historyLimit(cfg: QAConfig): number {
-    return Math.max(0, Math.min(HISTORY_MAX_ROUNDS, Number(cfg.history_max_length) || 0)) * 2;
-  }
-
-  private async getHistory(scope: string, cfg: QAConfig): Promise<ChatMessage[]> {
-    const all = await this.loadHistory();
-    const list = all[scope];
-    if (!Array.isArray(list) || list.length === 0) return [];
-    const max = this.historyLimit(cfg);
-    return max > 0 ? list.slice(-max) : [];
-  }
-
-  private async appendHistory(scope: string, query: string, answer: string, cfg: QAConfig): Promise<void> {
-    const max = this.historyLimit(cfg);
-    if (max <= 0) return;
-    const all = await this.loadHistory();
-    const list = Array.isArray(all[scope]) ? all[scope] : [];
-    list.push({ role: 'user', content: query }, { role: 'assistant', content: answer });
-    all[scope] = list.slice(-max);
-    this.historyCache = Promise.resolve(all);
-    try {
-      await songloft.storage.set(HISTORY_STORAGE_KEY, JSON.stringify(all));
-    } catch (e) {
-      songloft.log.warn(`[QA] failed to persist history: ${String(e)}`);
     }
   }
 }
