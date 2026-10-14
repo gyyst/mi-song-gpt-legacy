@@ -1,4 +1,3 @@
-import type { ChatStatus } from '../../src/chat/types';
 import { computed, reactive } from 'vue';
 import { del, get, messageOf, pluginWebSocketUrl, post, query } from './api';
 import type {
@@ -87,7 +86,6 @@ export interface ConfirmState {
 }
 
 export const state = reactive({
-  chatStatus: null as ChatStatus | null,
   initialized: false,
   loading: true,
   startupError: '',

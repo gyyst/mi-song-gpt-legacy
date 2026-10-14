@@ -48,6 +48,8 @@ const { MusicCommandService: VoiceEngine } = loadSource('../src/music/service.ts
   '../player/manager': players,
   '../voicecmd/ai_analyzer': {},
   '../voicecmd/qa_fallback': { QAFallback: class { } },
+  '../chat/memory': { ChatMemoryService: class { } },
+  '../ai/client': { AIClient: class { } },
   '../ws/conversation-stream': { notifyConversationOutcome: () => { } },
   '../voicecmd/online_searcher': { OnlineSearcher: class { } },
   '../handlers/playlist': {},
@@ -1691,21 +1693,15 @@ test('active chat detects volume controls without enabling the music engine', as
   });
 });
 
-test('DLNA takeover invalidates pending voice analysis before it can replace the cast', async () => {
+test('external control takeover invalidates pending voice analysis before it can replace the cast', async () => {
   await withClock(async () => {
-    const chatTypes = loadSource('../src/chat/types.ts', {});
-    const { VoiceDispatcher } = loadSource('../src/voicecmd/dispatcher.ts', { '../chat/types': chatTypes });
-    const { PlaybackCoordinator } = loadSource('../src/playback/coordinator.ts', { '../chat/types': chatTypes });
+    const { VoiceDispatcher } = loadSource('../src/voicecmd/dispatcher.ts', {});
     const { manager } = player(), wait = deferred(), calls = [];
-    manager.minaService.setOnControl = callback => { manager.minaService.notifyControl = callback; };
-    const config = { getChatConfig: async () => chatTypes.DEFAULT_CHAT_CONFIG, findDeviceGroup: async () => null };
-    const playback = new PlaybackCoordinator({ get: () => manager }, manager.minaService, config);
-    const music = { cancelPendingResume() { }, hasFixedControl: async () => false, handleMessage: async (_message, options) => { await wait.promise; if (options.current()) calls.push('stale music'); return true; } };
-    const chat = { status: () => ({ phase: 'completed', followup_until: 0 }), interruptForRouting: async () => undefined };
-    const dispatcher = new VoiceDispatcher(config, music, chat, playback);
+    const music = { cancelPendingResume() { }, fixedControlType: async () => undefined, hasFixedControl: async () => false, handleMessage: async (_message, options) => { await wait.promise; if (options.current()) calls.push('stale music'); return true; } };
+    const dispatcher = new VoiceDispatcher(music, { get: () => manager });
     dispatcher.submit({ account_id: 'account', device_id: 'speaker', message: { request_id: 'old', response: { answer: [{ question: '播放歌曲' }] } } });
-    await flush(); await manager.beginExternalPlayback(() => { }); wait.resolve(); await flush();
-    assert.deepEqual(calls, []); assert.equal(manager.isExternalPlayback(), true); dispatcher.close(); manager.cleanup();
+    await flush(); dispatcher.invalidateDevice('account', 'speaker'); wait.resolve(); await flush();
+    assert.deepEqual(calls, []); dispatcher.close(); manager.cleanup();
   });
 });
 

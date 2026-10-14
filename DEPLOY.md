@@ -32,7 +32,7 @@
 1. 打开 songloft 网页（`http://NAS_IP:58091`）→ 插件页面
 2. 无需卸载官方"智能音箱"(miot)——本插件 entryPath 为 `mi-song-gpt`，与官方 `miot` **可共存**
 3. 上传 `dist/mi-song-gpt.jsplugin.zip` 安装
-4. 安装后确认插件名为「mi-song-gpt」，版本 `2026.10.12`
+4. 安装后确认插件名为「mi-song-gpt」，版本 `2026.10.14`
 
 > 本定制版已移除 `updateUrl`，官方仓库的自动更新**不会**覆盖你的定制版。
 
@@ -57,6 +57,7 @@
 - **等待原生回答（秒）**：先等小爱答（默认 4 秒），命中"不知道/没听懂/没找到"类回答才接管；设 0 则不等直接接管
 - **历史轮数**：每台音箱保留的对话轮数（默认 10），支持"再讲细一点"这类追问
 - **单段播报上限**：长回答按句切分逐段播报（默认 100 字，与音箱 TTS 限制匹配）
+- **用户记忆**：开启后自动记录对话历史、提取事实与偏好（如"用户住在北京"），问答时注入上下文实现追问与个性化；同类问题问满 4 次自动生成话题画像（如"用户经常询问：A股指数行情（近30天4次）"）
 
 配置页自带两个测试按钮（不打断音箱）：
 
@@ -91,7 +92,9 @@ docker-compose 用户把对应 service 注释掉后 `docker compose up -d`。
 
 | 文件 | 改动 |
 |---|---|
-| `src/voicecmd/qa_fallback.ts` | **新增**：问答接管模块（兜底话术判定/等待原生回答/打断+占位/LLM+联网/历史/分段TTS） |
+| `src/voicecmd/qa_fallback.ts` | **新增**：问答接管模块（兜底话术判定/等待原生回答/打断+占位/LLM+联网/历史/分段TTS）；兜底话术持续扩充（盲区/加紧学习等小爱新话术） |
+| `src/chat/memory.ts` / `src/handlers/chat.ts` | **新增**：账号级用户记忆——对话历史、摘要（≥8 轮重建）、长期记忆自动提取（事实与偏好，手工编辑不覆盖）；**频繁话题画像**：保留期内同类问题问满 4 次自动聚合成一条画像记忆（LLM 命名标签，随历史衰减自动回收） |
+| `frontend/src/views/settings/VoiceSettings.vue` | 记忆管理面板（对话历史分页/长期记忆增删改/10s 静默自动刷新）；对话监听 WS 超时看门狗：连接在线但 15s 无帧自动降级 4s HTTP 轮询，收到帧恢复推送 |
 | `src/voicecmd/ai_analyzer.ts` | **判定 prompt 精简**：示例与冗余删除（1927 vs 上游 2730 字符，约省 1/3 输入）；prompt 含 `qa` 动作判定示例。temperature/max_tokens 保持上游语义「省略」（推理模型/代理兼容，上游测试强制） |
 | `src/music/service.ts` | 上游把 `voicecmd/engine.ts` 重构成转发到本文件；QA 兜底全部移植到这里：未命中分支接入问答接管；`processMessage` 回填 `outcome/outcome_detail/outcome_meta` 并调 `notifyConversationOutcome()` 补推 WS；AI 判定为 `qa` 时走问答、`deferResume` 时交派发器恢复；口令测试对 qa 指令只做诊断；`testQA`/`isQAEnabled`；默认播放模式 order→loop 两处 |
 | `src/voicecmd/engine.ts` | 上游已改为 3 行兼容转发（`MusicCommandService` 从 `music/service` 导出），本定制沿用 |
@@ -104,7 +107,7 @@ docker-compose 用户把对应 service 注释掉后 `docker compose up -d`。
 | `src/utils/ai_url.ts` | 新增 `aiResponsesUrl`（方舟 Responses 端点） |
 | `src/types.ts` / `src/config/manager.ts` | 新增 `QAConfig`/`VoiceOutcome` 类型与 `qa_config` 独立存储键 |
 | `frontend/src/views/settings/VoiceSettings.vue` 等 | 上游 4 面板语音设置中「commands」面板内嵌问答接管卡与问答测试；对话监听状态栏新增「AI判定/问答接管」状态 chips；最近对话记录每条标注来源徽标+耗时，并新增判定反馈/分阶段耗时 meta 行 |
-| `plugin.json` | 名称改为 mi-song-gpt；entryPath 改为 `mi-song-gpt`（与官方 miot 共存）；版本 2026.10.12；移除 updateUrl（防上游自动更新覆盖）；author 改为 wyrt0、homepage 指向本仓库；download_url 钉到本仓库 `releases/download/v2026.10.12/mi-song-gpt.jsplugin.zip`（官方 issue #2 意见）；保留上游 `publicPaths: ["/dlna"]`、renderEngine webview |
+| `plugin.json` | 名称改为 mi-song-gpt；entryPath 改为 `mi-song-gpt`（与官方 miot 共存）；版本 2026.10.14；移除 updateUrl（防上游自动更新覆盖）；author 改为 wyrt0、homepage 指向本仓库；download_url 钉到本仓库 `releases/download/v2026.10.14/mi-song-gpt.jsplugin.zip`（官方 issue #2 意见）；保留上游 `publicPaths: ["/dlna"]`、renderEngine webview |
 | `package.json` | name/description 为定制版标识，scripts 沿用上游（含 `build-chinese-data`） |
 | `src/account/manager.ts` / `src/player/manager.ts` 等 | 默认播放模式由「顺序播放」改为「列表循环」：新设备默认值、`normalizePlayMode` 兜底、`playMode` 初始值，以及定时任务 / 语音口令 / 联网搜歌 / 设备列表 / 前端各处兜底统一为 `loop`（模式弹层高亮改为「非列表循环才高亮」） |
 | `src/config/manager.ts` / `src/main.ts` | **新增** `migratePlayModeDefaultOnce()` 一次性迁移：把存量设备落盘的 `play_mode` 从 order 翻成 loop（`play_mode_default_migrated` 标志位，只执行一次；之后手动切回的顺序播放不会被覆盖） |

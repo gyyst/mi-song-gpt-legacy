@@ -20,8 +20,7 @@ import type {
   PlaylistProgress,
   PlaylistProgressStore,
 } from '../types';
-import { DEFAULT_CHAT_CONFIG, validateChatConfig } from '../chat/types';
-import type { ChatConfig } from '../chat/types';
+
 
 import { DEFAULT_MEMORY_MAX_RECORDS, normalizeMemoryMaxRecords } from '../memory/types';
 import { getDefaultVoiceCommands } from '../voicecmd/defaults';
@@ -125,16 +124,41 @@ function defaultQAConfig(): QAConfig {
     api_url: 'https://ark.cn-beijing.volces.com/api/v3',
     api_key: '',
     model: '',
-    timeout: 60,
+    timeout: 30,
     system_prompt: '你是一个智能音箱助手，请用简洁的口语回答用户的问题，每次回答控制在150字以内，不要使用 markdown、列表和特殊符号。',
-    history_max_length: 10,
     thinking_notice: '正在思考，请稍等',
     native_answer_wait_sec: 4,
     web_search_enabled: false,
     web_search_strategy: 'hybrid',
     web_search_fallback_notice: '联网搜索暂时不可用，以下内容可能不是最新。',
     max_reply_length: 100,
+    followup_seconds: 60,
+    memory_enabled: true,
+    context_turns: 12,
+    history_limit: 500,
+    history_days: 30,
   };
+}
+
+/**
+ * 读取时按字段合并默认值并做轻量钳制。
+ * 旧版 qa_config 存储可能缺少新增字段（或带着已废弃的 history_max_length），
+ * load() 不做合并，必须在这里补齐，调用方才能拿到完整 schema。
+ * 只读合并不回写磁盘；用户下次保存时自然落盘。
+ */
+function mergeQAConfig(stored: Partial<QAConfig> | null | undefined): QAConfig {
+  const merged: QAConfig = { ...defaultQAConfig(), ...(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {}) };
+  merged.timeout = Math.max(1, Math.min(30, Math.round(Number(merged.timeout) || 30)));
+  merged.native_answer_wait_sec = Math.max(0, Math.min(10, Number(merged.native_answer_wait_sec) || 0));
+  merged.max_reply_length = Math.max(0, Math.min(500, Math.round(Number(merged.max_reply_length) || 0)));
+  merged.followup_seconds = Math.max(0, Math.min(300, Math.round(Number(merged.followup_seconds) || 0)));
+  merged.context_turns = Math.max(1, Math.min(24, Math.round(Number(merged.context_turns) || 12)));
+  merged.history_limit = Math.max(12, Math.min(500, Math.round(Number(merged.history_limit) || 500)));
+  merged.history_days = Math.max(1, Math.min(30, Math.round(Number(merged.history_days) || 30)));
+  if (merged.web_search_strategy !== 'auto' && merged.web_search_strategy !== 'hybrid')
+    merged.web_search_strategy = 'hybrid';
+  delete (merged as unknown as Record<string, unknown>).history_max_length;
+  return merged;
 }
 
 /**
@@ -162,28 +186,6 @@ export class ConfigManager {
   // 歌单进度表：每次切歌都要读改写，不缓存就是每首歌一次多余的 storage.get。
   // 与上面两个 key 同一套约定（缓存 in-flight Promise + 写穿透）。
   private playlistProgressCache: Promise<PlaylistProgressStore> | null = null;
-
-  private chatConfigWrite: Promise<unknown> = Promise.resolve();
-
-  async getChatConfig(): Promise<ChatConfig> {
-    await this.chatConfigWrite.catch(() => { });
-    const raw = await songloft.storage.get('chat_config:v1');
-    if (!raw) return validateChatConfig({});
-    try { return validateChatConfig(JSON.parse(raw as string)); }
-    catch { throw new Error('AI 对话配置损坏，原配置已保留'); }
-  }
-
-  saveChatConfig(updates: Partial<ChatConfig>): Promise<ChatConfig> {
-    const pending = this.chatConfigWrite.catch(() => { }).then(async () => {
-      const raw = await songloft.storage.get('chat_config:v1');
-      const current = raw ? validateChatConfig(JSON.parse(raw as string)) : DEFAULT_CHAT_CONFIG;
-      const next = validateChatConfig(updates, current);
-      await songloft.storage.set('chat_config:v1', JSON.stringify(next));
-      return next;
-    });
-    this.chatConfigWrite = pending;
-    return pending;
-  }
 
   // ===== 通用存储读写 =====
 
@@ -600,9 +602,9 @@ export class ConfigManager {
 
   // ===== QA 问答接管配置 =====
 
-  /** 获取 QA 问答接管配置 */
+  /** 获取 QA 问答接管配置（读取时合并默认值并钳制，兼容缺字段的旧存储） */
   async getQAConfig(): Promise<QAConfig> {
-    return this.load<QAConfig>(STORAGE_KEY_QA_CONFIG, defaultQAConfig());
+    return mergeQAConfig(await this.load<Partial<QAConfig>>(STORAGE_KEY_QA_CONFIG, {}));
   }
 
   /** 保存 QA 问答接管配置 */

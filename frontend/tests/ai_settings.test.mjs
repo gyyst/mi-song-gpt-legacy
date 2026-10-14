@@ -133,9 +133,11 @@ test('AI configuration lives inside the voice page AI card; no separate settings
   assert.doesNotMatch(root, /id: 'ai'/);
   assert.doesNotMatch(root, /AISettings/);
   assert.match(page, /<AIModelSettings/);
-  assert.match(page, /<ChatSettings/);
+  assert.doesNotMatch(page, /ChatSettings/);
   assert.match(page, /<slot \/>/);
   assert.match(voice, /<AISettings/);
+  assert.match(voice, /用户记忆/);
+  assert.match(voice, /追问窗口/);
   const template = voice.slice(voice.indexOf('<template>'));
   assert.ok(template.indexOf('setQAEnabled') > template.indexOf('<AISettings') && template.indexOf('setQAEnabled') < template.indexOf('</AISettings>'), 'QA takeover UI must live inside the AI card');
   assert.doesNotMatch(voice, /打开 AI 设置/);

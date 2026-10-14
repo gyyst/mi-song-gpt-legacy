@@ -40,6 +40,8 @@ const { MusicCommandService: VoiceEngine } = loadSource('../src/music/service.ts
   '../player/url_builder': {},
   '../voicecmd/ai_analyzer': {},
   '../voicecmd/qa_fallback': { QAFallback: class { } },
+  '../chat/memory': { ChatMemoryService: class { } },
+  '../ai/client': { AIClient: class { } },
   '../ws/conversation-stream': { notifyConversationOutcome: () => { } },
   '../voicecmd/online_searcher': {},
   '../handlers/playlist': {},

@@ -393,13 +393,10 @@ export function registerConfigHandlers(
           qaConfig.model = newQA.model;
         }
         if (typeof newQA.timeout === 'number') {
-          qaConfig.timeout = Math.max(1, Math.min(180, newQA.timeout));
+          qaConfig.timeout = Math.max(1, Math.min(30, newQA.timeout));
         }
         if (typeof newQA.system_prompt === 'string') {
           qaConfig.system_prompt = newQA.system_prompt;
-        }
-        if (typeof newQA.history_max_length === 'number') {
-          qaConfig.history_max_length = Math.max(0, Math.min(20, Math.round(newQA.history_max_length)));
         }
         if (typeof newQA.thinking_notice === 'string') {
           qaConfig.thinking_notice = newQA.thinking_notice;
@@ -418,6 +415,21 @@ export function registerConfigHandlers(
         }
         if (typeof newQA.max_reply_length === 'number') {
           qaConfig.max_reply_length = Math.max(0, Math.min(500, Math.round(newQA.max_reply_length)));
+        }
+        if (typeof newQA.followup_seconds === 'number') {
+          qaConfig.followup_seconds = Math.max(0, Math.min(300, Math.round(newQA.followup_seconds)));
+        }
+        if (typeof newQA.memory_enabled === 'boolean') {
+          qaConfig.memory_enabled = newQA.memory_enabled;
+        }
+        if (typeof newQA.context_turns === 'number') {
+          qaConfig.context_turns = Math.max(1, Math.min(24, Math.round(newQA.context_turns)));
+        }
+        if (typeof newQA.history_limit === 'number') {
+          qaConfig.history_limit = Math.max(12, Math.min(500, Math.round(newQA.history_limit)));
+        }
+        if (typeof newQA.history_days === 'number') {
+          qaConfig.history_days = Math.max(1, Math.min(30, Math.round(newQA.history_days)));
         }
         await configManager.saveQAConfig(qaConfig);
       }

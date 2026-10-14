@@ -23,13 +23,17 @@ export interface QAConfig {
   model?: string;
   timeout?: number;
   system_prompt?: string;
-  history_max_length?: number;
   thinking_notice?: string;
   native_answer_wait_sec?: number;
   web_search_enabled?: boolean;
   web_search_strategy?: 'auto' | 'hybrid';
   web_search_fallback_notice?: string;
   max_reply_length?: number;
+  followup_seconds?: number;
+  memory_enabled?: boolean;
+  context_turns?: number;
+  history_limit?: number;
+  history_days?: number;
 }
 
 export interface MiotConfig {

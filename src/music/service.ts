@@ -17,6 +17,8 @@ import { URLBuilder } from '../player/url_builder';
 import { AIAnalyzer } from '../voicecmd/ai_analyzer';
 import { OnlineSearcher } from '../voicecmd/online_searcher';
 import { QAFallback } from '../voicecmd/qa_fallback';
+import { ChatMemoryService } from '../chat/memory';
+import { AIClient } from '../ai/client';
 import { updateDeviceStatusCache } from '../handlers/playlist';
 import { callHostAPI, getHostAPIBaseUrl } from '../utils/http';
 import { findFavoritesPlaylist } from '../utils/favorites';
@@ -221,6 +223,8 @@ export class MusicCommandService {
     aiAnalyzer?: AIAnalyzer,
     memoryService?: MemoryService,
     groupCoordinator?: GroupCoordinator,
+    chatMemory?: ChatMemoryService,
+    aiClient?: AIClient,
   ) {
     this.configManager = configManager;
     this.accountManager = accountManager;
@@ -231,7 +235,12 @@ export class MusicCommandService {
     this.groupCoordinator = groupCoordinator;
     this.onlineSearcher = new OnlineSearcher(configManager, groupCoordinator);
     this.memoryService = memoryService || new MemoryService();
-    this.qaFallback = new QAFallback(this.configManager, this.minaService);
+    this.qaFallback = new QAFallback(this.configManager, this.minaService, chatMemory || new ChatMemoryService(), aiClient || new AIClient());
+  }
+
+  /** 问答接管是否在进行中（热更新前忙碌探测） */
+  busyReason(): string {
+    return this.qaFallback.isBusy() ? 'QA answering' : '';
   }
 
   // ===== 公开方法 =====

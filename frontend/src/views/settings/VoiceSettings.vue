@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import SectionCard from '../../ui/SectionCard.vue';
 import SettingRow from '../../ui/SettingRow.vue';
 import SlButton from '../../ui/SlButton.vue';
@@ -9,7 +9,7 @@ import SlSelect from '../../ui/SlSelect.vue';
 import SlSwitch from '../../ui/SlSwitch.vue';
 import VoiceSectionNav from './voice/VoiceSectionNav.vue';
 import AISettings from './AISettings.vue';
-import { del, get, post, postLong, pluginWebSocketUrl } from '../../api';
+import { del, get, post, postLong, put, query, pluginWebSocketUrl } from '../../api';
 import {
   addWebhook,
   clearMemory,
@@ -150,6 +150,8 @@ const memoryLoading = ref(false);
 const expandedMemory = ref<string | null>(null);
 let conversationSocket: WebSocket | null = null;
 let conversationPoll: ReturnType<typeof setInterval> | null = null;
+let conversationLastFrameAt = 0;
+let conversationWatchdog: ReturnType<typeof setInterval> | null = null;
 
 function syncSourceDrafts(): void {
   for (const source of Array.isArray(state.config.external_search_sources) ? state.config.external_search_sources : []) {
@@ -244,6 +246,8 @@ onMounted(async () => {
 onUnmounted(() => {
   conversationSocket?.close();
   if (conversationPoll) clearInterval(conversationPoll);
+  if (conversationWatchdog) clearInterval(conversationWatchdog);
+  stopQAMemoryAutoRefresh();
 });
 
 function commandKey(command: VoiceCommand, index: number): string {
@@ -377,19 +381,32 @@ async function saveNumber(
   } catch { /* saveConfig presents the error */ }
 }
 
+function startConversationPoll(): void {
+  if (conversationPoll) return;
+  conversationPoll = setInterval(() => void loadConversationMessages(), 4000);
+}
+
+function stopConversationPoll(): void {
+  if (conversationPoll) clearInterval(conversationPoll);
+  conversationPoll = null;
+}
+
 function connectConversation(): void {
   disconnectConversation();
   if (typeof WebSocket === 'undefined') {
-    conversationPoll = setInterval(() => void loadConversationMessages(), 4000);
+    startConversationPoll();
     return;
   }
   try {
     conversationSocket = new WebSocket(pluginWebSocketUrl('/conversation/ws?limit=50'));
     conversationSocket.onopen = () => {
-      if (conversationPoll) clearInterval(conversationPoll);
-      conversationPoll = null;
+      stopConversationPoll();
+      conversationLastFrameAt = Date.now();
     };
     conversationSocket.onmessage = (event) => {
+      conversationLastFrameAt = Date.now();
+      // 帧到达即停掉看门狗触发的降级轮询，回到 WS 推送
+      stopConversationPoll();
       try {
         const frame = JSON.parse(String(event.data));
         // 快照与增量帧都过排序/upsert：到达顺序（含同批多条、outcome 补推）不再影响展示顺序
@@ -400,20 +417,27 @@ function connectConversation(): void {
     conversationSocket.onerror = () => conversationSocket?.close();
     conversationSocket.onclose = () => {
       conversationSocket = null;
-      if (state.config.conversation_monitor_enabled && !conversationPoll) {
-        conversationPoll = setInterval(() => void loadConversationMessages(), 4000);
-      }
+      if (conversationWatchdog) { clearInterval(conversationWatchdog); conversationWatchdog = null; }
+      if (state.config.conversation_monitor_enabled) startConversationPoll();
     };
+    // WS 超时看门狗：连接在线但长时间无帧（后端被长耗时 QA 占满轮询）时降级 HTTP 轮询；收到任何帧自动恢复
+    conversationLastFrameAt = Date.now();
+    if (conversationWatchdog) clearInterval(conversationWatchdog);
+    conversationWatchdog = setInterval(() => {
+      if (!conversationSocket || conversationPoll) return;
+      if (Date.now() - conversationLastFrameAt > 15000) startConversationPoll();
+    }, 5000);
   } catch {
-    conversationPoll = setInterval(() => void loadConversationMessages(), 4000);
+    startConversationPoll();
   }
 }
 
 function disconnectConversation(): void {
   conversationSocket?.close();
   conversationSocket = null;
-  if (conversationPoll) clearInterval(conversationPoll);
-  conversationPoll = null;
+  stopConversationPoll();
+  if (conversationWatchdog) clearInterval(conversationWatchdog);
+  conversationWatchdog = null;
 }
 
 async function refreshConversation(): Promise<void> {
@@ -641,7 +665,7 @@ async function testQA(): Promise<void> {
   qaTestResult.value = '';
   try {
     // 宿主默认 30s 调用超时；测试链路最坏是联网搜索 + 兜底对话两次上游调用（各可达 30s），放预算到 2*timeout+10s（clamp 30s~300s，宿主 v2.11.0+ 才认该头）
-    const budgetMs = (Math.max(1, Number(state.config.qa_config?.timeout) || 60) * 2 + 10) * 1000;
+    const budgetMs = (Math.max(1, Number(state.config.qa_config?.timeout) || 30) * 2 + 10) * 1000;
     const result = await postLong<{ text: string; used_search: boolean; elapsed_ms: number }>('/voice-commands/qa-test', { query: qaTestQuery.value.trim() }, budgetMs);
     qaTestSuccess.value = true;
     qaTestResult.value = `${result.text}\n\n[${result.used_search ? '联网搜索' : '本地对话'} · ${result.elapsed_ms} ms]`;
@@ -651,6 +675,98 @@ async function testQA(): Promise<void> {
   } finally {
     qaTestBusy.value = false;
   }
+}
+
+function setQAMemoryEnabled(enabled: boolean): void {
+  state.config.qa_config.memory_enabled = enabled;
+  qaSave();
+}
+
+// --- 用户记忆 / 对话历史（按账号，与设备无关；mi-song-gpt）---
+
+interface QATurn { id: string; user: string; assistant: string; created_at: number; phase: string; error?: string }
+interface QAMemory { id: string; content: string; manual?: boolean; source_ids?: string[] }
+
+const qaMemoryExpanded = ref(false);
+const qaMemoryBusy = ref(false);
+const qaHistory = ref<QATurn[]>([]);
+const qaMemories = ref<QAMemory[]>([]);
+const qaSummary = ref('');
+const qaHistoryOffset = ref(0);
+const qaHistoryTotal = ref(0);
+const qaMemoryDrafts = reactive<Record<string, string>>({});
+const newQAMemory = ref('');
+let qaMemoryVersion = 0;
+
+const qaMemoryIdentity = computed(() => query({ account_id: state.currentAccountId }));
+
+async function qaMemoryAction(run: () => Promise<void>): Promise<void> {
+  if (qaMemoryBusy.value) return;
+  qaMemoryBusy.value = true;
+  try { await run(); } catch (error) { notify(messageOf(error), 'error'); } finally { qaMemoryBusy.value = false; }
+}
+
+async function refreshQAMemory(): Promise<void> {
+  const version = ++qaMemoryVersion;
+  if (!state.currentAccountId) { qaHistory.value = []; qaMemories.value = []; qaSummary.value = ''; qaHistoryTotal.value = 0; return; }
+  const identity = qaMemoryIdentity.value;
+  const [h, m] = await Promise.all([
+    get<{ history: QATurn[]; total: number; summary: string }>(`/chat/history${query({ account_id: state.currentAccountId, offset: qaHistoryOffset.value, limit: 20 })}`),
+    get<{ memories: QAMemory[] }>(`/chat/memories${identity}`),
+  ]);
+  if (version !== qaMemoryVersion || identity !== qaMemoryIdentity.value) return;
+  qaHistory.value = h.history; qaHistoryTotal.value = h.total; qaSummary.value = h.summary; qaMemories.value = m.memories;
+}
+
+function toggleQAMemoryExpanded(): void {
+  qaMemoryExpanded.value = !qaMemoryExpanded.value;
+  if (qaMemoryExpanded.value) void qaMemoryAction(refreshQAMemory);
+}
+
+function resetQAMemoryPanel(): void {
+  qaMemoryVersion++;
+  qaHistory.value = []; qaMemories.value = []; qaSummary.value = '';
+  qaHistoryOffset.value = 0; qaHistoryTotal.value = 0;
+  for (const id of Object.keys(qaMemoryDrafts)) delete qaMemoryDrafts[id];
+  newQAMemory.value = '';
+}
+watch(() => state.currentAccountId, resetQAMemoryPanel);
+
+let qaMemoryAutoTimer: ReturnType<typeof setInterval> | null = null;
+let qaMemoryAutoInFlight = false;
+
+function stopQAMemoryAutoRefresh(): void {
+  if (qaMemoryAutoTimer) clearInterval(qaMemoryAutoTimer);
+  qaMemoryAutoTimer = null;
+  qaMemoryAutoInFlight = false;
+}
+
+// 面板展开期间 10s 静默刷新：话题记忆等后台维护异步落库，定时轮询天然覆盖；收起即停
+function syncQAMemoryAutoRefresh(): void {
+  if (!qaMemoryExpanded.value || qaMemoryAutoTimer) return;
+  qaMemoryAutoTimer = setInterval(() => {
+    if (qaMemoryAutoInFlight || !state.currentAccountId) return;
+    qaMemoryAutoInFlight = true;
+    refreshQAMemory().catch(() => { }).finally(() => { qaMemoryAutoInFlight = false; });
+  }, 10000);
+}
+
+watch(qaMemoryExpanded, (expanded) => {
+  if (expanded) syncQAMemoryAutoRefresh();
+  else stopQAMemoryAutoRefresh();
+});
+
+async function clearQAMemory(range: 'history' | 'memory' | 'all'): Promise<void> {
+  if (!(await confirmAction('清理问答记忆', '将删除当前账号的所选数据，摘要与自动记忆会重新构建。', '清理', true)).confirmed) return;
+  await post('/chat/clear', { account_id: state.currentAccountId, range });
+  qaHistoryOffset.value = 0;
+  await refreshQAMemory();
+}
+
+async function removeQATurn(id: string): Promise<void> {
+  if (!(await confirmAction('删除对话', '相关自动记忆也会删除，摘要将重新构建。', '删除', true)).confirmed) return;
+  await del(`/chat/history/${encodeURIComponent(id)}${qaMemoryIdentity.value}`);
+  await refreshQAMemory();
 }
 
 // --- 语音管线状态（对话监听卡状态栏 chips）---
@@ -740,7 +856,7 @@ function formatOutcomeMeta(item: ConversationMessage): string {
   for (const stage of meta.stages || []) {
     parts.push(`${stage.label} ${fmtMs(stage.ms)}`);
   }
-  parts.push(`共 ${fmtMs(meta.total_ms)}`);
+  parts.push(`共 ${fmtMs(meta.total_ms)}${item.outcome === 'llm' && item.outcome_detail === 'web_search' ? '（web_search）' : ''}`);
   return parts.join(' · ');
 }
 </script>
@@ -939,7 +1055,7 @@ function formatOutcomeMeta(item: ConversationMessage): string {
         <div class="field"><label class="field-label">API Key</label><SlInput :model-value="state.config.qa_config?.api_key || ''" type="password" placeholder="ark-..." @update:model-value="state.config.qa_config.api_key = $event" @change="qaSave" /></div>
         <div class="field-grid">
           <div class="field"><label class="field-label">模型</label><SlInput :model-value="state.config.qa_config?.model || ''" placeholder="如 doubao-1.5-pro-32k" @update:model-value="state.config.qa_config.model = $event" @change="qaSave" /></div>
-          <div class="field"><label class="field-label">超时（秒）</label><SlInput :model-value="String(state.config.qa_config?.timeout || 60)" type="number" @update:model-value="state.config.qa_config.timeout = Math.max(1, Math.min(180, Number($event) || 60))" @change="qaSave" /></div>
+          <div class="field"><label class="field-label">超时（秒）</label><SlInput :model-value="String(state.config.qa_config?.timeout || 30)" type="number" @update:model-value="state.config.qa_config.timeout = Math.max(1, Math.min(30, Number($event) || 30))" @change="qaSave" /><p class="field-help">1-30 秒。</p></div>
         </div>
         <div class="field-grid">
           <div class="field setting-field-control"><label class="field-label">联网搜索</label><SlSwitch :model-value="!!state.config.qa_config?.web_search_enabled" @update:model-value="setQAWebSearch" /></div>
@@ -949,13 +1065,61 @@ function formatOutcomeMeta(item: ConversationMessage): string {
         <div class="field"><label class="field-label">人设提示词</label><SlInput :model-value="state.config.qa_config?.system_prompt || ''" placeholder="问答人设与回答长度约束" @update:model-value="state.config.qa_config.system_prompt = $event" @change="qaSave" /></div>
         <div class="field-grid">
           <div class="field"><label class="field-label">思考提示</label><SlInput :model-value="state.config.qa_config?.thinking_notice ?? ''" placeholder="打断小爱后先播的提示，留空关闭" @update:model-value="state.config.qa_config.thinking_notice = $event" @change="qaSave" /></div>
-          <div class="field"><label class="field-label">历史轮数（0-20）</label><SlInput :model-value="String(state.config.qa_config?.history_max_length ?? 10)" type="number" @update:model-value="state.config.qa_config.history_max_length = Math.max(0, Math.min(20, Number($event) || 0))" @change="qaSave" /></div>
+          <div class="field"><label class="field-label">追问窗口（秒）</label><SlInput :model-value="String(state.config.qa_config?.followup_seconds ?? 60)" type="number" @update:model-value="state.config.qa_config.followup_seconds = Math.max(0, Math.min(300, Number($event) || 0))" @change="qaSave" /><p class="field-help">0-300 秒；上次大模型回答后此时间内再问，跳过小爱直接回答。</p></div>
         </div>
         <div class="field-grid">
           <div class="field"><label class="field-label">等待原生回答（秒）</label><SlInput :model-value="String(state.config.qa_config?.native_answer_wait_sec ?? 4)" type="number" @update:model-value="state.config.qa_config.native_answer_wait_sec = Math.max(0, Math.min(10, Number($event) || 0))" @change="qaSave" /><p class="field-help">0-10 秒；等小爱先答，命中"不知道/没听懂"类回答才接管。</p></div>
           <div class="field"><label class="field-label">单段播报上限</label><SlInput :model-value="String(state.config.qa_config?.max_reply_length ?? 100)" type="number" @update:model-value="state.config.qa_config.max_reply_length = Math.max(0, Math.min(500, Number($event) || 0))" @change="qaSave" /><p class="field-help">超长回答按句切分逐段播报，0 表示不切分。</p></div>
         </div>
         <div class="command-test-panel command-test-panel-inset"><strong>问答测试</strong><p>直接验证问答模型与联网搜索，不会打断音箱播报。</p><div class="inline-fields"><SlInput v-model="qaTestQuery" placeholder="问点什么，比如：今天北京天气怎么样" @submit="testQA" /><SlButton variant="outlined" label="测试问答" icon="science" :disabled="qaTestBusy" @click="testQA" /></div><pre v-if="qaTestResult" class="result-pre" :class="qaTestSuccess ? 'result-success' : 'result-error'">{{ qaTestResult }}</pre></div>
+      <h3 class="card-title section-subtitle">用户记忆</h3>
+      <p class="field-help">按账号记录问答摘要与长期事实；近期回答会自动带上上下文，同账号的各音箱共享记忆。</p>
+      <SettingRow title="启用用户记忆"><SlSwitch :model-value="state.config.qa_config?.memory_enabled !== false" @update:model-value="setQAMemoryEnabled" /></SettingRow>
+      <div class="field-grid">
+        <div class="field"><label class="field-label">上下文轮数（1–24）</label><SlInput :model-value="String(state.config.qa_config?.context_turns ?? 12)" type="number" @update:model-value="state.config.qa_config.context_turns = Math.max(1, Math.min(24, Number($event) || 12))" @change="qaSave" /></div>
+        <div class="field"><label class="field-label">历史保留天数（1–30）</label><SlInput :model-value="String(state.config.qa_config?.history_days ?? 30)" type="number" @update:model-value="state.config.qa_config.history_days = Math.max(1, Math.min(30, Number($event) || 30))" @change="qaSave" /></div>
+      </div>
+      <div class="field"><label class="field-label">历史最大轮数（12–500）</label><SlInput :model-value="String(state.config.qa_config?.history_limit ?? 500)" type="number" @update:model-value="state.config.qa_config.history_limit = Math.max(12, Math.min(500, Number($event) || 500))" @change="qaSave" /></div>
+      <h3 class="card-title section-subtitle">记忆与对话历史</h3>
+      <p class="field-help">当前账号的问答记忆（与设备无关）。</p>
+      <button type="button" class="advanced-toggle" @click="toggleQAMemoryExpanded">
+        <span>{{ qaMemoryExpanded ? '收起记忆管理' : '展开记忆管理' }}</span>
+        <SlIcon :name="qaMemoryExpanded ? 'expand_less' : 'expand_more'" :size="20" />
+      </button>
+      <template v-if="qaMemoryExpanded">
+        <p v-if="qaSummary" class="field-help">摘要：{{ qaSummary }}</p>
+        <strong>对话历史</strong>
+        <p v-if="!qaHistory.length" class="field-help">暂无对话记录</p>
+        <article v-for="turn in qaHistory" :key="turn.id" class="sub-panel sub-panel-inset">
+          <small>{{ new Date(turn.created_at).toLocaleString() }}</small>
+          <p>你：{{ turn.user }}</p>
+          <p v-if="turn.assistant">AI：{{ turn.assistant }}</p>
+          <p v-if="turn.error" role="alert">{{ turn.error }}</p>
+          <div class="field-actions"><SlButton label="删除" variant="text" :disabled="qaMemoryBusy" @click="qaMemoryAction(() => removeQATurn(turn.id))" /></div>
+        </article>
+        <div class="field-actions">
+          <SlButton label="上一页" variant="outlined" :disabled="qaMemoryBusy || qaHistoryOffset === 0" @click="qaMemoryAction(async () => { qaHistoryOffset = Math.max(0, qaHistoryOffset - 20); await refreshQAMemory(); })" />
+          <SlButton label="下一页" variant="outlined" :disabled="qaMemoryBusy || qaHistoryOffset + qaHistory.length >= qaHistoryTotal" @click="qaMemoryAction(async () => { qaHistoryOffset += 20; await refreshQAMemory(); })" />
+          <SlButton label="清空历史和摘要" variant="text" :disabled="qaMemoryBusy" @click="qaMemoryAction(() => clearQAMemory('history'))" />
+        </div>
+        <strong>长期记忆</strong>
+        <p class="field-help">从已完成回答自动提取明确的用户事实与偏好；手工编辑不会被覆盖。</p>
+        <article v-for="memory in qaMemories" :key="memory.id" class="sub-panel sub-panel-inset">
+          <SlInput :model-value="qaMemoryDrafts[memory.id] ?? memory.content" @update:model-value="qaMemoryDrafts[memory.id] = $event" aria-label="记忆内容" />
+          <small>{{ memory.manual ? '手工维护' : '自动提取' }} · 来源：{{ (memory.source_ids || []).join('、') || '手工添加' }}</small>
+          <div class="field-actions">
+            <SlButton label="保存记忆" variant="text" :disabled="qaMemoryBusy" @click="qaMemoryAction(async () => { await put(`/chat/memories/${encodeURIComponent(memory.id)}`, { account_id: state.currentAccountId, content: qaMemoryDrafts[memory.id] ?? memory.content }); delete qaMemoryDrafts[memory.id]; await refreshQAMemory(); })" />
+            <SlButton label="删除记忆" variant="text" :disabled="qaMemoryBusy" @click="qaMemoryAction(async () => { await del(`/chat/memories/${encodeURIComponent(memory.id)}${qaMemoryIdentity}`); await refreshQAMemory(); })" />
+          </div>
+        </article>
+        <div class="field"><label class="field-label">新增记忆</label><SlInput v-model="newQAMemory" aria-label="新增记忆" /></div>
+        <div class="field-actions">
+          <SlButton label="添加记忆" variant="outlined" :disabled="qaMemoryBusy || !newQAMemory.trim()" @click="qaMemoryAction(async () => { await post('/chat/memories', { account_id: state.currentAccountId, content: newQAMemory }); newQAMemory = ''; await refreshQAMemory(); })" />
+          <SlButton label="清空长期记忆" variant="text" :disabled="qaMemoryBusy" @click="qaMemoryAction(() => clearQAMemory('memory'))" />
+          <SlButton label="全部清空" variant="text" :disabled="qaMemoryBusy" @click="qaMemoryAction(() => clearQAMemory('all'))" />
+          <SlButton label="刷新" variant="text" :disabled="qaMemoryBusy" @click="qaMemoryAction(refreshQAMemory)" />
+        </div>
+      </template>
     </div>
   </AISettings>
   </div>

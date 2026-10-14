@@ -311,15 +311,19 @@ export interface QAConfig {
   api_url: string;                 // OpenAI 兼容地址（火山方舟填 .../api/v3）
   api_key: string;
   model: string;
-  timeout: number;                 // 秒数，默认 60
+  timeout: number;                 // 秒数 1–30，默认 30（宿主对插件出站请求硬限 30s）
   system_prompt: string;           // 问答人设提示词
-  history_max_length: number;      // 每设备保留的对话轮数（0=不携带历史）
   thinking_notice: string;         // 打断小爱后先播的占位提示，空串=不播
   native_answer_wait_sec: number;  // 等待小爱原生回答的最长秒数（0=不等）
   web_search_enabled: boolean;     // 联网搜索（火山方舟 Responses API web_search 工具）
   web_search_strategy: 'auto' | 'hybrid'; // auto=全联网；hybrid=本地正则判时效性再联网
   web_search_fallback_notice: string;     // 搜索失败降级普通回答时的前置提示
   max_reply_length: number;        // TTS 单段最大长度，超长按句切分（0=不切分）
+  followup_seconds: number;        // 追问窗口：距上一轮回答 N 秒内跳过小爱闸门直接作答（0=关闭）
+  memory_enabled: boolean;         // 自动提取与使用长期记忆（用户记忆）
+  context_turns: number;           // 携带给模型的最近对话轮数（1–24）
+  history_limit: number;           // 历史保留的最大轮数（12–500）
+  history_days: number;            // 历史保留天数（1–30）
 }
 
 /** AI 分析结果 */

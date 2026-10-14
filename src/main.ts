@@ -1,10 +1,7 @@
 import { AIClient } from './ai/client';
-import { AIChatService } from './chat/service';
-import { SpeechService } from './chat/speech';
-import { PlaybackCoordinator } from './playback/coordinator';
+import { ChatMemoryService } from './chat/memory';
 import { VoiceDispatcher } from './voicecmd/dispatcher';
 import { chatBody, registerChatHandlers } from './handlers/chat';
-import { WS_CHAT_PATH, handleChatWebSocket } from './ws/chat-stream';
 import { createRouter, parseQuery } from '@songloft/plugin-sdk';
 import type { HTTPRequest, HTTPResponse, WebSocketRequest, InboundWebSocket } from '@songloft/plugin-sdk';
 import { ConfigManager } from './config/manager';
@@ -83,7 +80,7 @@ let voiceEngine: VoiceEngine;
 let indexingManager: IndexingManager;
 let memoryService: MemoryService;
 let dlnaReceiver: DLNAReceiver;
-let aiChat: AIChatService;
+let chatMemory: ChatMemoryService;
 let voiceDispatcher: VoiceDispatcher;
 
 async function onInit(): Promise<void> {
@@ -125,11 +122,13 @@ async function onInit(): Promise<void> {
   // 注入对话推送依赖（WebSocket 订阅端点 /conversation/ws 使用）
   initConversationStream(conversationMonitor);
   const aiClient = new AIClient();
-  voiceEngine = new VoiceEngine(configManager, accountManager, minaService, playlistManagerMap, indexingManager, new AIAnalyzer((run, current, scope) => aiClient.foregroundRequest(run, current, scope)), memoryService, groupCoordinator);
+  // 用户记忆：摘要/事实提取的 LLM 请求走 AIClient（kind=summary/memory），与问答共用连接配置
+  chatMemory = new ChatMemoryService((connection, messages, kind) => aiClient.request(connection, messages, kind));
+  voiceEngine = new VoiceEngine(configManager, accountManager, minaService, playlistManagerMap, indexingManager, new AIAnalyzer((run, current, scope) => aiClient.foregroundRequest(run, current, scope)), memoryService, groupCoordinator, chatMemory, aiClient);
 
-  const playback = new PlaybackCoordinator(playlistManagerMap, minaService, configManager);
-  aiChat = new AIChatService(configManager, playback, new SpeechService(minaService), aiClient);
-  voiceDispatcher = new VoiceDispatcher(configManager, voiceEngine, aiChat, playback);
+  voiceDispatcher = new VoiceDispatcher(voiceEngine, playlistManagerMap);
+  // mina 控制被更新的操作抢占时（如 DLNA 接管），作废该设备仍在途的语音分析
+  minaService.setOnControl((account, device) => voiceDispatcher.invalidateDevice(account, device));
 
   const executor = new TaskExecutor(configManager, accountManager, minaService, playlistManagerMap, indexingManager, conversationMonitor, groupCoordinator, voiceEngine);
   scheduler = new Scheduler(configManager, executor);
@@ -160,7 +159,7 @@ async function onInit(): Promise<void> {
   registerConversationHandlers(router, conversationMonitor, configManager);
   registerScheduleHandlers(router, scheduler, configManager);
   registerVoiceCommandHandlers(router, configManager, accountManager, voiceEngine, voiceDispatcher);
-  registerChatHandlers(router, configManager, aiChat);
+  registerChatHandlers(router, configManager, chatMemory);
   registerIndexingHandlers(router, indexingManager);
   registerMemoryHandlers(router, memoryService, configManager);
   registerLyricHandlers(router);
@@ -215,7 +214,7 @@ async function onInit(): Promise<void> {
 async function onDeinit(): Promise<void> {
   songloft.log.info('mi-song-gpt 插件停止...');
   voiceDispatcher?.close();
-  aiChat?.close();
+  chatMemory?.close();
   voiceEngine?.close();
   await dlnaReceiver?.close();
   scheduler?.stop();
@@ -232,7 +231,7 @@ async function onDeinit(): Promise<void> {
 // 直接返回对象会变成 Go 的 map 文本（map[busy:true ...]），后端解析不出来。
 async function onQueryBusy(): Promise<string> {
   try {
-    const reason = aiChat?.busyReason() || dlnaReceiver?.busyReason() || playlistManagerMap?.busyReason() || '';
+    const reason = voiceEngine?.busyReason() || dlnaReceiver?.busyReason() || playlistManagerMap?.busyReason() || '';
     return JSON.stringify({ busy: reason !== '', reason });
   } catch (e) {
     // 探测本身出错时按空闲处理，不能因为探测失败就永久阻塞更新
@@ -246,13 +245,12 @@ async function onHTTPRequest(req: HTTPRequest): Promise<HTTPResponse> {
     try { const input = { ...parseQuery(req.query), ...chatBody(req) }; if (typeof input.account_id === 'string' && typeof input.device_id === 'string') voiceDispatcher.invalidateDevice(input.account_id, input.device_id); } catch { }
   }
   if (req.path === '/receiver/config' || req.path.startsWith('/dlna/')) return dlnaReceiver.handle(req);
-  if (req.method !== 'GET' && (req.path.startsWith('/groups') || req.path.startsWith('/account') || req.path === '/config' || req.path.includes('/managed'))) { await aiChat.cancelAll(); voiceDispatcher.invalidate(); aiChat.configurationChanged(); }
+  if (req.method !== 'GET' && (req.path.startsWith('/groups') || req.path.startsWith('/account') || req.path === '/config' || req.path.includes('/managed'))) { voiceDispatcher.invalidate(); }
   return await router.handle(req);
 }
 
 // 入站 WebSocket：播放状态推送订阅（/status/ws）+ 对话记录推送订阅（/conversation/ws）
 async function onWebSocket(req: WebSocketRequest, socket: InboundWebSocket): Promise<void> {
-  if (req.path === WS_CHAT_PATH) { await handleChatWebSocket(req, socket, configManager, aiChat); return; }
   if (req.path === WS_STATUS_PATH) {
     await handleStatusWebSocket(req, socket);
     return;
