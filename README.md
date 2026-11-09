@@ -2,9 +2,9 @@
 
 基于 [songloft-plugin-miot](https://github.com/songloft-org/songloft-plugin-miot) 定制的 Songloft 智能音箱 JS 插件：在原插件的音乐播放能力之上，新增**问答接管**与 **AI 播放意图语义判定**——小爱答得上的不打扰，答不上来的由大模型接话（可联网搜索），播放类指令始终优先走本地曲库。
 
-**【基于官方 v2026.10.12 版本】**（上游 main 分支 e2be608，2026-10-12 线），本仓库版本 v2026.10.14。
+**【独立维护分支 [gyyst/mi-song-gpt](https://github.com/gyyst/mi-song-gpt)】**：基础版本来自 [wyrt000/mi-song-gpt](https://github.com/wyrt000/mi-song-gpt) v2026.10.14，此后在本仓库独立演进。
 
-> ℹ️ 与上游的区别：已移除 `updateUrl`（不检查上游更新，自动更新不会覆盖本定制版）；`download_url` 指向本仓库 Release，供插件商店/订阅源安装。详细部署、配置、验收与排错见 [DEPLOY.md](DEPLOY.md)。
+> ℹ️ 本仓库的 `plugin.json` 带有 `updateUrl`，指向本仓库 main 分支。Songloft 会从**本仓库**检查并下载更新，不再跟随上游。首次从上游版本切换过来需要手动上传一次本仓库的 zip，之后即可在 Songloft 插件页直接更新。详细部署、配置、验收与排错见 [DEPLOY.md](DEPLOY.md)。
 
 > ™️ **商标声明**：本插件中提到的 "MIoT" "MiHome" 等协议 / 产品名称均归各自商标权人所有，相关名称的出现仅出于互操作和指示性合理使用目的。本插件**未获得任何商标持有人的授权或背书**，与上述商标持有人**无任何关联**。
 
@@ -19,6 +19,7 @@
 | **用户记忆** | 按账号自动记录对话历史与摘要，从回答中提取事实与偏好（如"用户住在北京"）注入后续问答，支持追问与个性化；手工编辑的记忆不会被自动覆盖 |
 | **频繁话题画像** | 同类问题在保留期内问满 4 次，自动生成一条话题画像记忆（如"用户经常询问：A股指数行情（近30天4次）"），LLM 自动命名标签，随历史衰减自动回收 |
 | **默认列表循环** | 默认播放模式由「顺序播放」改为「列表循环」，播完自动从头继续；升级时自动迁移存量设备的旧设置（仅一次），可在播放条随时切回 |
+| **外部搜索单曲播完停止** | 修复未配置目标歌单时，外部搜索结果直接推流、音箱播完自动重拉同一 URL 造成的单曲无限循环；改为 PlaylistManager 单曲临时列表（order 模式），播完即停 |
 
 上游自带能力（设备分组多房间同步、法定节假日定时任务、外部搜索源接入等）保持不变，见下文。
 
@@ -64,6 +65,8 @@ npm run validate    # 校验 plugin.json 哈希
 
 安装：songloft 网页 → 插件页面 → 无需卸载官方「智能音箱」(miot)，两者 entryPath 不同、可共存 → 上传 `dist/mi-song-gpt.jsplugin.zip`。安装后插件名为 **mi-song-gpt**。
 
+在线更新：首次安装本仓库的包之后，Songloft 会按 `plugin.json` 的 `updateUrl` 检查本仓库 main 分支的版本并下载 `download_url`；从上游版本切换过来需要手动上传一次。
+
 配置页四张卡片（对话监听 / 语音口令 / AI 口令分析 / 问答接管）、验收清单与常见问题见 [DEPLOY.md](DEPLOY.md)。
 
 ## Development
@@ -106,14 +109,12 @@ npm run validate    # verify plugin.json hashes
 
 ## 发版节奏
 
-版本号就是发版日期(如 `2026.7.27`,无前导零)。CI 每天北京时间 08:17 自动检查一次:
+版本号默认使用发版日期（如 `2026.11.9`，无前导零）：
 
-- **自上次发版以来有新提交** → 构建并发布 `v<当天日期>`,即「今天的修改明天出新包」。
-- **没有新提交** → 跳过,不产生空版本。
+- **推送 `v*` 标签** → 自动构建并发布对应版本；
+- **Actions 页手动触发** → 可指定版本号，留空则使用当天日期。
 
-所以版本号会跳日(比如 `2026.7.25` 的下一版是 `2026.7.27`),这是正常的——中间那天没有改动。需要立刻出包时,维护者可在 Actions 页手动触发,手动触发不受上述门禁限制。
-
-同一天重复发版会覆盖当天的 Release,但版本号不变,已安装的客户端**不会**提示升级,需等次日。
+发布后 workflow 会把 `plugin.json`（version / download_url / updateUrl / entryHash / zipHash）与 `package.json` 回写 main，Songloft 通过 `updateUrl` 检查更新。同一天重复发布同一版本号会覆盖 Release；已安装客户端是否提示升级取决于版本号是否变化。
 
 ## 作为搜索源接入 mi-song-gpt（供插件开发者）
 
@@ -172,7 +173,8 @@ function registerToMiSongGpt() {
 ## Author
 
 - 上游 [songloft-plugin-miot](https://github.com/songloft-org/songloft-plugin-miot)：hanxi
-- 本定制版 mi-song-gpt：wyrt0
+- 上游定制版 [mi-song-gpt](https://github.com/wyrt000/mi-song-gpt)：wyrt0
+- 本独立维护分支：[gyyst](https://github.com/gyyst)
 
 ## 免责声明
 
@@ -183,6 +185,6 @@ function registerToMiSongGpt() {
 
 ## License
 
-Apache-2.0 © 2026 hanxi
+Apache-2.0 © 2026 hanxi；本分支修改 © 2026 gyyst。
 
-完整协议文本见 [LICENSE](LICENSE)。本定制版基于上游 [songloft-plugin-miot](https://github.com/songloft-org/songloft-plugin-miot) main 分支（e2be608，2026-10-12 线）修改，改动说明见上文「与上游的区别」及 Author 节。
+完整协议文本见 [LICENSE](LICENSE)。本分支基于 [wyrt000/mi-song-gpt](https://github.com/wyrt000/mi-song-gpt) v2026.10.14（其又基于上游 [songloft-plugin-miot](https://github.com/songloft-org/songloft-plugin-miot) main 分支 e2be608）修改，主要改动见上文「新增功能」中的「外部搜索单曲播完停止」。

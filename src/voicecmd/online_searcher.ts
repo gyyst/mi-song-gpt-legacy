@@ -371,6 +371,27 @@ export class OnlineSearcher {
       songloft.log.warn(`[OnlineSearcher] Playlist takeover failed for playlist ${appendedPlaylistId}, falling back to single URL push`);
     }
 
+    // 未配置目标歌单：同样交给 PlaylistManager，以「单曲临时列表 + order 模式」播放。
+    // 不能直接 playURL——那条路径不注册切歌定时器/结束探测，音箱自然播完后会重拉
+    // 同一 URL，表现为单曲无限循环（#437 同类问题）。order 模式单曲列表没有下一首，
+    // onSongFinished 会走 stop()，播完即停。
+    if (pm) {
+      const playable = await this.buildStandaloneSong(imported, song);
+      const ok = await pm.playWithSongs([playable], 0, 'order', `单曲: ${song.title}`, '');
+      if (ok) {
+        // 增量把这首独立远程歌曲加入内存索引，避免下一次点播再次走外部搜索。
+        if (indexingManager) {
+          indexingManager.addImportedSong(
+            { id: imported.id, title: song.title, artist: song.artist, album: song.album },
+            undefined,
+          );
+        }
+        songloft.log.info('[OnlineSearcher] Playing online song via standalone playlist (order, stop at end): ' + song.title + ' - ' + song.artist);
+        return true;
+      }
+      songloft.log.warn('[OnlineSearcher] Standalone playlist takeover failed, falling back to direct URL push');
+    }
+
     // 用返回的 url 构造完整播放 URL（相对路径，URLBuilder 会拼接 server_host 和 token）。
     // 必须带上 force_mp3 / volume_normalize：直推路径漏了这些选项时，音箱会拿到不能解码的
     // 源格式流而亮灯不出声（songloft-org/songloft-plugin-miot#62）。
@@ -408,6 +429,41 @@ export class OnlineSearcher {
 
     songloft.log.info('[OnlineSearcher] Playing online song: ' + song.title + ' - ' + song.artist + ' url=' + playUrl);
     return true;
+  }
+
+  /**
+   * 构造供 PlaylistManager 播放的单曲对象。
+   * 优先从宿主读取完整歌曲（含 type/duration/封面等），失败时用导入响应和搜索结果兜底。
+   */
+  private async buildStandaloneSong(
+    imported: { id: number; url: string },
+    song: OnlineSearchResult,
+  ): Promise<any> {
+    try {
+      const full = await songloft.songs.getById(imported.id);
+      if (full) return full;
+    } catch (e) {
+      songloft.log.warn('[OnlineSearcher] Failed to load imported song, using fallback fields: ' + String(e));
+    }
+    return {
+      id: imported.id,
+      type: 'remote',
+      title: song.title,
+      artist: song.artist || '',
+      album: song.album || '',
+      duration: song.duration || 0,
+      file_path: '',
+      url: imported.url,
+      cover_path: '',
+      cover_url: song.cover_url || '',
+      lyric_url: '',
+      file_size: 0,
+      format: '',
+      bit_rate: 0,
+      sample_rate: 0,
+      is_live: false,
+      cache_hash: '',
+    };
   }
 
   /**

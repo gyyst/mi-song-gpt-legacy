@@ -1,200 +1,161 @@
 name: Release Plugin
 
+# 自动发布：
+# - 推送 v* 标签时自动构建并发布对应版本；
+# - 也可以在 Actions 页面手动触发，版本号留空时使用日期版本 YYYY.M.D。
+#
+# 发布后会把构建产物里的 plugin.json（version / download_url / updateUrl / 哈希）
+# 与 package.json 回写到 main，Songloft 通过 plugin.json 的 updateUrl 检查更新。
+
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（留空则自动生成日期版本，格式：Y.M.D）'
+        description: '版本号（留空则自动使用日期版本 YYYY.M.D）'
         required: false
         default: ''
 
-# 串行化同名 workflow，避免重复触发同时发同一个版本号。
-# 注意它防不住「别人往 main 推代码」——排队放行后 checkout 仍是各自触发时的 SHA，
-# 所以 bump 的 push 另有 rebase 重试兜底，见 release job 末尾。
+permissions:
+  contents: write
+
 concurrency:
   group: release-plugin
   cancel-in-progress: false
 
 jobs:
-  gate:
-    runs-on: ubuntu-latest
-    outputs:
-      should_release: ${{ steps.check.outputs.should_release }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # 必须：默认 depth=1 且不拉 tag，git describe 会失败
-
-      - name: Check for new commits since last release
-        id: check
-        run: |
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "手动触发，跳过门禁直接发版"
-            echo "should_release=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
-          if [ -z "$LAST_TAG" ]; then
-            echo "仓库尚无 tag，视为首次发版"
-            echo "should_release=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 排除本 workflow 自己产生的 bump 提交，只数真实改动
-          COUNT="$(git log --oneline --invert-grep \
-                     --grep='^chore(release): bump to v' \
-                     "${LAST_TAG}..HEAD" | wc -l)"
-          echo "自 ${LAST_TAG} 以来的提交："
-          git log --oneline "${LAST_TAG}..HEAD"
-          echo "其中非发版提交数：${COUNT}"
-
-          if [ "$COUNT" -gt 0 ]; then
-            echo "should_release=true" >> $GITHUB_OUTPUT
-            echo "✅ 有 ${COUNT} 个新提交，继续发版" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "should_release=false" >> $GITHUB_OUTPUT
-            echo "⏭️ 自 ${LAST_TAG} 以来无新提交，跳过今日发版" >> $GITHUB_STEP_SUMMARY
-          fi
-
   release:
-    needs: gate
-    if: needs.gate.outputs.should_release == 'true'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          fetch-depth: 0 # 必须：bump 的 push 冲突后要 rebase，shallow clone 上做不了
+          fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="${INPUT_VERSION#v}"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            VERSION="${REF_NAME#v}"
+          else
+            VERSION="$(TZ='Asia/Shanghai' date +'%Y.%-m.%-d')"
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9A-Za-z][0-9A-Za-z._-]*$'; then
+            echo "::error::无效的版本号: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "发布版本: $VERSION"
+
+      - name: Prepare manifest
+        id: manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          ENTRY_PATH="$(node -p "require('./plugin.json').entryPath")"
+          ZIP_NAME="${ENTRY_PATH}.jsplugin.zip"
+          TAG="v${VERSION}"
+          DOWNLOAD_URL="https://github.com/${REPOSITORY}/releases/download/${TAG}/${ZIP_NAME}"
+          UPDATE_URL="https://raw.githubusercontent.com/${REPOSITORY}/main/plugin.json"
+          export VERSION DOWNLOAD_URL UPDATE_URL
+          node -e "
+            const fs = require('fs');
+            const plugin = JSON.parse(fs.readFileSync('plugin.json', 'utf8'));
+            plugin.version = process.env.VERSION;
+            plugin.download_url = process.env.DOWNLOAD_URL;
+            plugin.updateUrl = process.env.UPDATE_URL;
+            fs.writeFileSync('plugin.json', JSON.stringify(plugin, null, 2) + '\n');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          {
+            echo "entry_path=$ENTRY_PATH"
+            echo "zip_name=$ZIP_NAME"
+            echo "tag=$TAG"
+            echo "download_url=$DOWNLOAD_URL"
+          } >> "$GITHUB_OUTPUT"
+          echo "产物: dist/${ZIP_NAME}"
+          echo "下载地址: ${DOWNLOAD_URL}"
 
       - name: Install dependencies
         run: npm ci
 
       - name: Build frontend
-        run: cd frontend && npm ci && npx vite build
-
-      - name: Resolve version
-        id: version
         run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="$(TZ='Asia/Shanghai' date +'%Y.%-m.%-d')"
-          fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Generated version: ${VERSION}"
+          cd frontend
+          npm ci
+          npx vite build
 
-      - name: Update version in plugin.json / package.json
+      - name: Build and validate
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          node -e "
-            const fs = require('fs');
-            for (const f of ['plugin.json', 'package.json']) {
-              const p = JSON.parse(fs.readFileSync(f, 'utf-8'));
-              p.version = '${VERSION}';
-              fs.writeFileSync(f, JSON.stringify(p, null, 2) + '\n');
-            }
-          "
+          npm run build
+          npm run validate
 
-      - name: Inject Tracely config and plugin version
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          sed -i "s|appId: ''|appId: '$TRACELY_APP_ID'|" static/js/app.js
-          sed -i "s|appSecret: ''|appSecret: '$TRACELY_APP_SECRET'|" static/js/app.js
-          sed -i "s|host: ''|host: '$TRACELY_HOST'|" static/js/app.js
-          sed -i "s|const PLUGIN_VERSION = '.*'|const PLUGIN_VERSION = '${VERSION}'|" static/js/app.js
-        env:
-          TRACELY_APP_ID: ${{ secrets.TRACELY_APP_ID }}
-          TRACELY_APP_SECRET: ${{ secrets.TRACELY_APP_SECRET }}
-          TRACELY_HOST: ${{ secrets.TRACELY_HOST }}
-
-      - name: Build
-        run: npm run build
-
-      - name: Extract plugin info
-        id: plugin_info
-        run: |
-          ENTRY_PATH=$(node -p "require('./plugin.json').entryPath")
-          ZIP_NAME="${ENTRY_PATH}.jsplugin.zip"
-          echo "entryPath=${ENTRY_PATH}" >> $GITHUB_OUTPUT
-          echo "zip_name=${ZIP_NAME}" >> $GITHUB_OUTPUT
-
-      # 先把 bump 推上去，再建 Release 并把 tag 钉到这个提交上。反过来做的话
-      # tag 会落在 bump 之前，checkout 该 tag 得到的 plugin.json 版本号是上一版
-      # （v2026.8.24 的 tag 就指着 bump 前那个 commit）。
-      # dist/ 已在上一步落盘，这里改 plugin.json 不影响已构建的产物 —— 打进 zip 的
-      # plugin.json 仍是不带 download_url 的那份，保持原有产物内容不变。
-      - name: Commit version bump and push
-        id: bump
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          ZIP_NAME="${{ steps.plugin_info.outputs.zip_name }}"
-          TAG="v${VERSION}"
-          # download_url 是可预测的，不必等 Release 建好再回填
-          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ZIP_NAME}"
-          node -e "
-            const fs = require('fs');
-            const p = JSON.parse(fs.readFileSync('plugin.json', 'utf-8'));
-            p.version = '${VERSION}';
-            p.download_url = '${DOWNLOAD_URL}';
-            fs.writeFileSync('plugin.json', JSON.stringify(p, null, 2) + '\n');
-            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf-8'));
-            pkg.version = '${VERSION}';
-            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add plugin.json package.json
-          if git diff --staged --quiet; then
-            echo "版本号与 download_url 均无变化，跳过 bump 提交"
-          else
-            git commit -m "chore(release): bump to v${VERSION}"
-            # 从 checkout 到这里已经过了整个构建时长（npm ci + 两次 build），这期间
-            # 任何人往 main 推一个提交都会让裸 push 被拒、整个发版红掉。bump 只碰
-            # plugin.json / package.json 的版本号，rebase 到远端几乎不可能真冲突。
-            pushed=0
-            for attempt in 1 2 3; do
-              if git push; then pushed=1; break; fi
-              echo "push 被拒（第 ${attempt} 次），rebase 到远端后重试"
-              git fetch origin "${GITHUB_REF_NAME}"
-              if ! git rebase "origin/${GITHUB_REF_NAME}"; then
-                git rebase --abort || true
-                echo "::error::rebase 冲突，通常意味着有另一次发版在并行改版本号；请检查后手动重跑"
-                exit 1
-              fi
-              sleep $((attempt * 5))
-            done
-            if [ "$pushed" != 1 ]; then
-              echo "::error::3 次重试后仍无法推送 bump 提交"
-              exit 1
-            fi
-          fi
-          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-
-      - name: Create GitHub Release on this repo
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.manifest.outputs.tag }}
+          ZIP_NAME: ${{ steps.manifest.outputs.zip_name }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          ZIP_NAME="${{ steps.plugin_info.outputs.zip_name }}"
-          TAG="${{ steps.bump.outputs.tag }}"
-
-          # 删除已存在的同名 Release / Tag（重发版兼容）
-          if gh release view "${TAG}" &>/dev/null; then
-            gh release delete "${TAG}" --yes --cleanup-tag
+          NOTES="自动构建的 mi-song-gpt 插件 v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist/${ZIP_NAME}" --clobber
+            gh release edit "$TAG" --title "v${VERSION}" --notes "$NOTES"
+          else
+            gh release create "$TAG" "dist/${ZIP_NAME}" \
+              --title "v${VERSION}" \
+              --notes "$NOTES" \
+              --target "$GITHUB_SHA"
           fi
 
-          gh release create "${TAG}" \
-            "dist/${ZIP_NAME}" \
-            --target "${{ steps.bump.outputs.sha }}" \
-            --title "v${VERSION}" \
-            --notes "自动构建的 JS 插件 v${VERSION}"
+      - name: Commit release metadata to main
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+
+          # 标签指向历史提交时，避免把旧版本的哈希写回最新的 main。
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            echo "::warning::当前提交不是 main 最新提交，跳过 plugin.json 回写"
+            exit 0
+          fi
+
+          # 保存构建后的清单（version / download_url / updateUrl / entryHash / zipHash）。
+          cp plugin.json /tmp/release-plugin.json
+          cp package.json /tmp/release-package.json
+          git checkout -B main origin/main
+          cp /tmp/release-plugin.json plugin.json
+          cp /tmp/release-package.json package.json
+          git add plugin.json package.json
+
+          if git diff --staged --quiet; then
+            echo "清单无变化，无需提交"
+            exit 0
+          fi
+
+          git commit -m "chore(release): v${VERSION}"
+          git push origin main
+          echo "已回写版本与更新地址: v${VERSION}"

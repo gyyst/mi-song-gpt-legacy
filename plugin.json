@@ -1,14 +1,14 @@
 {
   "$schema": "https://raw.githubusercontent.com/songloft-org/plugin-toolchain/main/schemas/plugin.schema.json",
   "name": "mi-song-gpt",
-  "version": "2026.10.14",
-  "description": "基于 songloft-plugin-miot 的定制版。执行流程：固定口令 → 语音记忆 → 搜索口令 → AI 语义判定 → 问答接管。新增问答接管（小爱答不上来时由大模型接管，可联网搜索/带上下文/分段播报）、AI 播放意图语义判定、对话记录来源徽标与分阶段耗时、语音记忆重播；播放类指令优先本地曲库，其次外部搜索推流；默认播放模式为列表循环",
-  "author": "wyrt0",
-  "homepage": "https://github.com/wyrt000/mi-song-gpt",
+  "version": "2026.11.9",
+  "description": "基于 songloft-plugin-miot 的定制版（独立维护分支）。执行流程：固定口令 → 语音记忆 → 搜索口令 → AI 语义判定 → 问答接管。新增问答接管（小爱答不上来时由大模型接管，可联网搜索/带上下文/分段播报）、AI 播放意图语义判定、对话记录来源徽标与分阶段耗时、语音记忆重播；播放类指令优先本地曲库，其次外部搜索推流；本分支修复外部搜索单曲播完后重复播放的问题",
+  "author": "wyrt0 / gyyst",
+  "homepage": "https://github.com/gyyst/mi-song-gpt",
   "license": "Apache-2.0",
   "icon": "frontend/public/icon.svg",
   "entryPath": "mi-song-gpt",
-  "main": "main.js",
+  "main": "main.jsc",
   "minHostVersion": "2.9.5",
   "renderEngine": "webview",
   "permissions": [
@@ -25,7 +25,8 @@
   "publicPaths": [
     "/dlna"
   ],
-  "download_url": "https://github.com/wyrt000/mi-song-gpt/releases/download/v2026.10.14/mi-song-gpt.jsplugin.zip",
-  "entryHash": "2dcedd0d96e5e4b0fdca91ad86020e414a5e4c7bfb77077f4d330892a5655bdc",
-  "zipHash": "930945d435ca88ed461e60ea5ac2a14aa909ca3bea3509b32c603fed35265889"
+  "updateUrl": "https://raw.githubusercontent.com/gyyst/mi-song-gpt/main/plugin.json",
+  "download_url": "https://github.com/gyyst/mi-song-gpt/releases/download/v2026.11.9/mi-song-gpt.jsplugin.zip",
+  "entryHash": "87ffca629bcc76e4452fcc908968720580e397ba2534a42d0b59c5edc500c71e",
+  "zipHash": "c84af417d03677bb68263ce4bd5de0f47ca912144c9ce7dcb4553d6bf27a8f2a"
 }
