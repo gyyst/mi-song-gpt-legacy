@@ -113,7 +113,8 @@ docker-compose 用户把对应 service 注释掉后 `docker compose up -d`。
 | `src/config/manager.ts` / `src/main.ts` | **新增** `migratePlayModeDefaultOnce()` 一次性迁移：把存量设备落盘的 `play_mode` 从 order 翻成 loop（`play_mode_default_migrated` 标志位，只执行一次；之后手动切回的顺序播放不会被覆盖） |
 | `src/player/manager.ts` | 播完/落盘失败上报 `source=mi-song-gpt`（上游为 `miot`） |
 | `.github/workflows/release.yml` | 支持推送 `v*` 标签与手动触发；构建 frontend + 插件，自动回填 `version` / `download_url` / `updateUrl` / 哈希并回写 main，供 Songloft 在线更新 |
-| `src/voicecmd/online_searcher.ts` | **修复外部搜索单曲播放循环**：未配置目标歌单时不再直接 `playURL`，改为 `PlaylistManager.playWithSongs([song], 0, 'order')` 单曲临时列表，注册切歌定时器，播完即停（避免音箱重拉同一 URL） |
+| `src/voicecmd/online_searcher.ts` | **修复外部搜索单曲播放循环**：未配置目标歌单时不再直接 `playURL`，改为 `PlaylistManager.playWithSongs([song], 0, 'order')` 单曲临时列表，注册切歌定时器，播完即停（避免音箱重拉同一 URL）；**新增「播完自动连播」**（`external_search_auto_continue`）：开启后单曲播完自动从 provider candidates / 同歌手搜索 / 已导入网络歌曲中续播，链路状态与队列代数绑定，换队列即失效 |
+| `src/player/manager.ts` | **新增临时队列补充接口**：`appendSongs()` / `setQueueRefillHook()` / `replenishQueue()`，队列低水位提前补歌、播完前等最后一次补充；`queueGeneration` 防止旧异步回调把歌追加到新队列 |
 
 说明：DLNA 接收器（`src/receiver/*`、`publicPaths /dlna`）、AI 对话（`chat`）、`voiceDispatcher` 派发器等为上游 2026.10.12 线新增能力，随基线合入，非本定制改动。
 

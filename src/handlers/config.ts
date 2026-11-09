@@ -104,6 +104,7 @@ export function registerConfigHandlers(
           external_search_playlist_id: config.external_search_playlist_id ?? '',
           external_search_timeout: config.external_search_timeout ?? 6,
           external_search_no_import: !!config.external_search_no_import,
+          external_search_auto_continue: !!config.external_search_auto_continue,
           search_priority: normalizeSearchPriority(config.search_priority),
           music_api_model_disabled: config.music_api_model_disabled || [],
           music_api_model_defaults: [...DEFAULT_MUSIC_API_MODELS],
@@ -254,6 +255,11 @@ export function registerConfigHandlers(
       // 更新 external_search_no_import
       if (body.external_search_no_import !== undefined) {
         config.external_search_no_import = !!body.external_search_no_import;
+      }
+
+      // 更新 external_search_auto_continue（播完自动连播）
+      if (body.external_search_auto_continue !== undefined) {
+        config.external_search_auto_continue = !!body.external_search_auto_continue;
       }
 
       // 更新 search_priority

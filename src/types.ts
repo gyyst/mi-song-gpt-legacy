@@ -175,6 +175,7 @@ export interface PluginConfig {
   external_search_playlist_id: string; // 外部搜索导入后追加到的歌单 ID，空串表示不追加
   external_search_timeout: number;     // 外部搜索超时（秒），默认 6
   external_search_no_import: boolean;   // 不入库直接播放：命中直链型结果时直接把原始 URL 推给音箱，不写入曲库（临时链接友好）
+  external_search_auto_continue: boolean; // 播完自动连播：单曲点播来自外部搜索且未配置目标歌单时，播完后自动从搜索源/曲库挑选其他网络歌曲继续播放
   search_priority: SearchPriority;     // 搜歌优先级策略
   music_api_model_disabled?: string[]; // 显式禁用 Music API 的型号（覆盖内置默认清单）
   indicator_light_enabled?: boolean;

@@ -46,6 +46,7 @@ const defaultConfig: MiotConfig = {
   external_search_playlist_id: '',
   external_search_timeout: 6,
   external_search_no_import: false,
+  external_search_auto_continue: false,
   search_priority: 'parallel',
   music_api_model_disabled: [],
   music_api_model_defaults: [],

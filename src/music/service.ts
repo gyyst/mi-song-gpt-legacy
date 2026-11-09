@@ -1802,7 +1802,17 @@ export class MusicCommandService {
       return false;
     }
 
-    songloft.log.warn(`[MusicCommandService] 走独立歌曲路径播放（不在任何歌单，无自动续播）: "${standalone.title}" - ${standalone.artist} id=${standalone.id} type=${standalone.type}`);
+    // 曲库里已有的独立网络歌曲同样参与「播完自动连播」：首次点播走外部搜索导入后，
+    // 之后再点同一首歌会命中 remote_song 路径，必须在这里也启动链路，否则第二次就播完即停。
+    void this.onlineSearcher.startAutoContinue(pm, {
+      title: standalone.title,
+      artist: standalone.artist || '',
+      id: standalone.id,
+    }, this.indexingManager).catch((e) => {
+      songloft.log.warn('[MusicCommandService] Failed to start auto-continue: ' + String(e));
+    });
+
+    songloft.log.warn(`[MusicCommandService] 走独立歌曲路径播放（不在任何歌单，开启自动连播时播完续播网络歌曲）: "${standalone.title}" - ${standalone.artist} id=${standalone.id} type=${standalone.type}`);
     return true;
   }
 

@@ -187,6 +187,12 @@ const LANDING_FAILURE_CIRCUIT_BREAK = 3;
 /** 临时失败只跳过五分钟，网络或音源恢复后允许重新尝试（songloft-org/songloft#494）。 */
 export const UNPLAYABLE_SONG_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * 自动连播队列低水位：当前歌之后剩余可播歌曲少于此数时，后台触发补充回调。
+ * 提前补而不是等播完再补，避免网络搜索的几秒延迟变成歌与歌之间的空档。
+ */
+const QUEUE_REFILL_THRESHOLD = 2;
+
 type SongFailureReason = 'prefetch' | 'landing' | 'early-stop';
 
 /**
@@ -374,6 +380,12 @@ export class PlaylistManager {
   // 表现为前 20 多秒空白 + 尾部被砍）。改为先定后用：reserveNextIndex() 定一次，
   // 预热与自动切歌共用同一个结果。
   private pendingNextIndex: number = -1;
+  // 队列代数：整体替换播放队列（play/playWithSongs/...）时自增，供异步的
+  // 「队列播完补充」回调校验自己是否还属于当前队列，防止旧回调把歌追加到新队列里。
+  private queueGeneration: number = 0;
+  // 队列低水位补充回调（自动连播）：返回要追加到临时队列末尾的歌曲。
+  private queueRefillHook?: () => Promise<Song[] | null>;
+  private queueRefillInFlight: Promise<number> | null = null;
   private voiceSuspendedPosition = 0;
   private voiceSuspendedAt: number = 0; // suspendForVoiceInteraction 首次调用时间戳
   private tempPlaylistName: string = ''; // 临时歌单名称（如"歌手: 周杰伦"），playlistId < 0 时有效
@@ -495,6 +507,96 @@ export class PlaylistManager {
     this.onAdvanceHook = hook;
   }
 
+  /**
+   * 注册队列低水位补充回调（自动连播用）。
+   * 回调返回要追加到临时队列末尾的歌曲；返回空/null 表示没有更多歌，队列播完即停。
+   * 只在临时队列（playWithSongs 建立的单曲/歌手列表）生效。
+   */
+  setQueueRefillHook(hook: (() => Promise<Song[] | null>) | undefined): void {
+    this.queueRefillHook = hook;
+    this.queueRefillInFlight = null;
+  }
+
+  /** 当前队列代数：每次整体替换队列自增，供异步补充回调校验上下文 */
+  getQueueGeneration(): number {
+    return this.queueGeneration;
+  }
+
+  /**
+   * 把歌曲追加到当前临时队列末尾（不改变当前播放的歌曲）。
+   * 真实歌单的内容由服务端定义，不能凭空追加，故非临时队列直接返回 0。
+   * @returns 实际追加的歌曲数（按 id 去重）
+   */
+  appendSongs(songs: Song[]): number {
+    const added = this.appendSongsInternal(songs);
+    if (added > 0) {
+      songloft.log.info(`[PlaylistManager] 队列追加 ${added} 首，当前 index=${this.currentIndex} total=${this.songs.length}`);
+    }
+    return added;
+  }
+
+  private appendSongsInternal(songs: Song[]): number {
+    if (!songs || songs.length === 0) return 0;
+    if (!isTempPlaylistId(this.playlistId)) return 0;
+
+    const seen = new Set<number>();
+    for (const s of this.songs) {
+      if (s && s.id > 0) seen.add(s.id);
+    }
+
+    let added = 0;
+    for (const s of songs) {
+      if (!s || !(s.id > 0) || seen.has(s.id)) continue;
+      seen.add(s.id);
+      this.songs.push(s);
+      added++;
+    }
+
+    if (added > 0) {
+      this.totalSongs = this.songs.length;
+      // 队列长度变了，之前算好的下一首索引（尤其是 -1 = 没有下一首）必须重算
+      this.clearPendingNextIndex();
+    }
+    return added;
+  }
+
+  /**
+   * 队列低水位时补充歌曲。force=false 且剩余充足时直接返回 0。
+   * 并发调用共享同一个在途请求，保证回调只触发一次、歌曲不会重复追加。
+   * @returns 本次实际追加的歌曲数
+   */
+  async replenishQueue(force = false): Promise<number> {
+    const hook = this.queueRefillHook;
+    if (!hook) return 0;
+    // 自动连播只补充临时队列；真实歌单播完就该结束，不做任何外部追加
+    if (!isTempPlaylistId(this.playlistId)) return 0;
+    if (this.queueRefillInFlight) return await this.queueRefillInFlight;
+
+    const remaining = this.songs.length - this.currentIndex - 1;
+    if (!force && remaining >= QUEUE_REFILL_THRESHOLD) return 0;
+
+    const generation = this.queueGeneration;
+    const task = (async () => {
+      let songs: Song[] | null = null;
+      try {
+        songs = await hook();
+      } catch (e) {
+        songloft.log.warn('[PlaylistManager] 队列补充回调失败: ' + String(e));
+        return 0;
+      }
+      // 等待期间队列可能已被新播放替换，绝不能再往新队列里追加旧歌
+      if (this.queueGeneration !== generation) return 0;
+      return this.appendSongsInternal(songs || []);
+    })();
+
+    this.queueRefillInFlight = task;
+    try {
+      return await task;
+    } finally {
+      if (this.queueRefillInFlight === task) this.queueRefillInFlight = null;
+    }
+  }
+
   setAnnounceOnSongChange(enabled: boolean): void {
     this.announceOnSongChange = enabled;
   }
@@ -509,6 +611,7 @@ export class PlaylistManager {
    */
   async play(playlistId: number, startIndex?: number, mode?: PlayMode, opts?: { randomStart?: boolean; isCurrent?: () => boolean }): Promise<boolean> {
     if (opts?.isCurrent?.() === false) return false;
+    this.queueGeneration++;
     this.endExternalPlayback();
     // 立即停止定时器和重置状态，防止 loadPlaylistSongs 期间旧定时器触发 onSongFinished
     this.stopCheckTimer();
@@ -572,6 +675,7 @@ export class PlaylistManager {
    */
   async playPlaylistFromSong(playlistId: number, songId: number, mode?: PlayMode, fallbackIndex?: number, isCurrent?: () => boolean): Promise<boolean> {
     if (isCurrent?.() === false) return false;
+    this.queueGeneration++;
     this.endExternalPlayback();
     // 立即停止定时器和重置状态，防止 loadPlaylistSongs 期间旧定时器触发 onSongFinished
     this.stopCheckTimer();
@@ -626,6 +730,7 @@ export class PlaylistManager {
    */
   async playWithSongs(songs: Song[], startIndex: number, mode: PlayMode, label?: string, artistQuery?: string, isCurrent?: () => boolean): Promise<boolean> {
     if (isCurrent?.() === false) return false;
+    this.queueGeneration++;
     this.endExternalPlayback();
     this.stopCheckTimer();
     this.state = 'idle';
@@ -1468,6 +1573,7 @@ export class PlaylistManager {
    * 使用已有歌曲列表初始化播放列表（恢复用）
    */
   initWithSongs(songs: Song[], startIndex: number, playMode: PlayMode, playlistId: number): void {
+    this.queueGeneration++;
     this.songs = songs;
     this.totalSongs = songs.length;
     this.currentIndex = (startIndex >= 0 && startIndex < songs.length) ? startIndex : 0;
@@ -1482,6 +1588,7 @@ export class PlaylistManager {
    * 用歌手歌曲列表初始化临时歌单（恢复用，不自动播放）
    */
   initWithTempArtist(songs: Song[], artistName: string, playMode: PlayMode): void {
+    this.queueGeneration++;
     this.songs = songs;
     this.totalSongs = songs.length;
     this.currentIndex = 0;
@@ -3111,6 +3218,24 @@ export class PlaylistManager {
       this.clearPendingNextIndex();
     }
     if (nextIdx < 0) {
+      // 自动连播：队列播完时向补充回调要歌（外部搜索是异步的，这里等它返回再决定停不停）。
+      // 等待期间用户可能停止/切歌/换了新队列，回来必须核对上下文，否则会把已停的播放又拉起来。
+      const finishedIndex = this.currentIndex;
+      const finishedSongId = this.songs[finishedIndex]?.id;
+      const finishedTimerGeneration = this.checkTimerGeneration;
+      const added = await this.replenishQueue(true);
+      if (this.state !== 'playing' || this.currentIndex !== finishedIndex ||
+        this.songs[this.currentIndex]?.id !== finishedSongId ||
+        this.checkTimerGeneration !== finishedTimerGeneration) {
+        songloft.log.info('[PlaylistManager] Queue refill finished but playback context changed, abort auto-next');
+        return;
+      }
+      if (added > 0) {
+        nextIdx = this.reserveNextIndex();
+        songloft.log.info(`[PlaylistManager] Queue refilled (+${added}), next index=${nextIdx}`);
+      }
+    }
+    if (nextIdx < 0) {
       songloft.log.info('[PlaylistManager] No next song, playback complete');
       this.state = 'stopped';
       this.playStartTimeMs = 0;
@@ -3121,6 +3246,9 @@ export class PlaylistManager {
     const ok = await this.playCurrent();
     if (ok) {
       await this.persistState();
+      // 低水位预补：当前歌之后剩不到 QUEUE_REFILL_THRESHOLD 首就提前补，
+      // 把搜索耗时藏在正在播放的这首歌里，避免每批歌播完都出现空档。
+      void this.replenishQueue();
       return;
     }
 
@@ -3142,6 +3270,7 @@ export class PlaylistManager {
     }
     if (retryOk) {
       await this.persistState();
+      void this.replenishQueue();
       return;
     }
 
@@ -3153,6 +3282,7 @@ export class PlaylistManager {
       const skipOk = await this.playCurrent();
       if (skipOk) {
         await this.persistState();
+        void this.replenishQueue();
         return;
       }
     }
