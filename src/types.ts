@@ -178,6 +178,7 @@ export interface PluginConfig {
   external_search_playlist_id: string; // 外部搜索导入后追加到的歌单 ID，空串表示不追加
   external_search_timeout: number;     // 外部搜索超时（秒），默认 6
   external_search_no_import: boolean;   // 不入库直接播放：命中直链型结果时直接把原始 URL 推给音箱，不写入曲库（临时链接友好）
+  external_search_auto_continue: boolean; // 播完自动连播：单曲点播来自外部搜索且未配置目标歌单时，播完后自动从搜索源/曲库挑选其他网络歌曲继续播放
   search_priority: SearchPriority;     // 搜歌优先级策略
   music_api_model_disabled?: string[]; // 显式禁用 Music API 的型号（覆盖内置默认清单）
   indicator_light_enabled?: boolean;
@@ -196,6 +197,8 @@ export interface PluginConfig {
   hourly_chime_resume_enabled?: boolean; // 整点报时后续播，默认关闭
   max_song_index: number;
   ai_config: AIConfig;
+  qa_config: QAConfig;   // 问答接管配置（mi-song-gpt 新增，独立存储键 qa_config）
+  play_mode_default_migrated?: boolean; // 一次性迁移标志：默认播放模式 order->loop 是否已迁移过存量设备
 }
 
 // ===== 定时任务 =====
@@ -302,6 +305,32 @@ export interface AIConfig {
   timeout: number;         // 秒数，默认 6
 }
 
+/**
+ * QA 问答接管配置（mi-song-gpt 新增）
+ *
+ * 与 ai_config（语义判定）分离：判定用快而便宜的小模型（如 qwen-flash），
+ * 问答用强模型（如豆包/DeepSeek），两者可各配各的服务商。
+ */
+export interface QAConfig {
+  enabled: boolean;
+  api_url: string;                 // OpenAI 兼容地址（火山方舟填 .../api/v3）
+  api_key: string;
+  model: string;
+  timeout: number;                 // 秒数 1–30，默认 30（宿主对插件出站请求硬限 30s）
+  system_prompt: string;           // 问答人设提示词
+  thinking_notice: string;         // 打断小爱后先播的占位提示，空串=不播
+  native_answer_wait_sec: number;  // 等待小爱原生回答的最长秒数（0=不等）
+  web_search_enabled: boolean;     // 联网搜索（火山方舟 Responses API web_search 工具）
+  web_search_strategy: 'auto' | 'hybrid'; // auto=全联网；hybrid=本地正则判时效性再联网
+  web_search_fallback_notice: string;     // 搜索失败降级普通回答时的前置提示
+  max_reply_length: number;        // TTS 单段最大长度，超长按句切分（0=不切分）
+  followup_seconds: number;        // 追问窗口：距上一轮回答 N 秒内跳过小爱闸门直接作答（0=关闭）
+  memory_enabled: boolean;         // 自动提取与使用长期记忆（用户记忆）
+  context_turns: number;           // 携带给模型的最近对话轮数（1–24）
+  history_limit: number;           // 历史保留的最大轮数（12–500）
+  history_days: number;            // 历史保留天数（1–30）
+}
+
 /** AI 分析结果 */
 export interface AIAnalysisResult {
   /** 匹配到的操作类型，与 VoiceCommand.type 对应 */
@@ -352,6 +381,48 @@ export interface ConversationMessage {
   device_id: string;
   device_name: string;
   message: AskMessage;
+  /**
+   * 语音引擎的处理来源（mi-song-gpt 新增，供对话记录 UI 展示路由结果）。
+   * 由 monitor 在 voice_engine 回调返回后回填进缓冲区里的消息对象。
+   */
+  outcome?: VoiceOutcomeSource;
+  /** 来源的补充说明（如命中的口令类型、AI 动作），用于 UI 悬浮提示 */
+  outcome_detail?: string;
+  /** 结构化的判定反馈与分阶段耗时（UI「最近对话记录」meta 行用），随 outcome 一起回填 */
+  outcome_meta?: OutcomeMeta;
+}
+
+/** 语音引擎处理结果来源 */
+export type VoiceOutcomeSource = 'rule' | 'memory' | 'search' | 'ai' | 'xiaoai' | 'llm' | 'none';
+
+/** 单个处理阶段的耗时（key 供代码分支判断，label 直接给 UI 显示） */
+export interface OutcomeStage {
+  key: 'rule' | 'memory' | 'ai' | 'search' | 'exec' | 'native' | 'llm';
+  label: string;
+  ms: number;
+}
+
+/** 语音引擎对单条消息的判定反馈与耗时明细（mi-song-gpt） */
+export interface OutcomeMeta {
+  /** 语义判定结果：只要判定器启用且返回了结果就带上，无论最终是否执行 */
+  ai?: {
+    action: string;
+    confidence: string;
+    params?: AIAnalysisResult['params'];
+  };
+  /** 分阶段耗时（按发生顺序） */
+  stages?: OutcomeStage[];
+  /** handleMessage 全程耗时 */
+  total_ms: number;
+  /** 是否真正执行了动作或完成接管 */
+  executed?: boolean;
+}
+
+/** 语音引擎处理结果（handleMessage 返回值，monitor 据此回填 outcome） */
+export interface VoiceOutcome {
+  source: VoiceOutcomeSource;
+  detail?: string;
+  meta?: OutcomeMeta;
 }
 
 // ===== 播放状态 =====

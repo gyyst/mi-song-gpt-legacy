@@ -9,8 +9,16 @@ export function hostPathPrefix(): string {
   return match ? match[1] : '';
 }
 
+// 从当前页面路径捕获插件路由段（entryPath），随 plugin.json 的 entryPath 走，
+// 免得硬编码名字——改 entryPath 只需改 plugin.json 一处。
+// vite dev 路径不含该段，回退为当前构建的 entryPath。
+function entryPathSegment(): string {
+  const match = window.location.pathname.match(/^.*\/api\/v1\/jsplugin\/([^/]+)/);
+  return match ? match[1] : 'mi-song-gpt';
+}
+
 function pluginBase(): string {
-  return `${hostPathPrefix()}/api/v1/jsplugin/miot`;
+  return `${hostPathPrefix()}/api/v1/jsplugin/${entryPathSegment()}`;
 }
 
 export class ApiError extends Error {
@@ -67,20 +75,26 @@ export function unwrap<T>(value: unknown): T {
   return decodePayload<T>(value, 0, true);
 }
 
+/** 宿主 writeJSONError 的体是 {error, detail}（无 success 字段）：detail 是底层原因，必须带上 */
+function withDetail(message: string, payload: unknown): string {
+  const detail = (payload as { detail?: string } | null)?.detail;
+  return detail && detail !== message ? `${message} — ${detail}` : message;
+}
+
 function decodePayload<T>(value: unknown, status: number, ok: boolean): T {
   const payload = value as Partial<ApiEnvelope<T>> | null;
   if (payload && typeof payload === 'object' && 'success' in payload) {
     if (payload.success === true) {
       return payload.data as T;
     }
-    throw new ApiError(payload.error || '请求失败，请稍后重试', status);
+    throw new ApiError(withDetail(payload.error || '请求失败，请稍后重试', payload), status);
   }
   if (!ok) {
     const detail = (payload as { detail?: string } | null)?.detail
       || (payload as { error?: string; message?: string } | null)?.error
       || (payload as { error?: string; message?: string } | null)?.message
       || `请求失败 (${status})`;
-    throw new ApiError(detail, status);
+    throw new ApiError(withDetail(detail, payload), status);
   }
   return value as T;
 }
@@ -99,6 +113,27 @@ export async function post<T>(path: string, body: unknown = {}): Promise<T> {
 
 export async function put<T>(path: string, body: unknown): Promise<T> {
   return browserRequest<T>('PUT', path, body);
+}
+
+/**
+ * POST，带 `X-Plugin-Timeout-Ms`（宿主 v2.11.0+ 放宽插件调用超时到 [30s, 300s]，
+ * 旧宿主会忽略该头并保持 30s 默认）。慢端点（问答测试这类要跑两次上游 LLM 调用的）用。
+ * 错误消息附带宿主返回的 detail（如 "scheduler: call timeout"），不再只有通用文案。
+ */
+export async function postLong<T>(path: string, body: unknown, timeoutMs: number): Promise<T> {
+  const token = pluginApi()?.getAuthToken?.();
+  const clamped = Math.max(30000, Math.min(300000, Math.round(timeoutMs)));
+  const response = await fetch(`${pluginBase()}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      'X-Plugin-Timeout-Ms': String(clamped),
+    },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json();
+  return decodePayload<T>(payload, response.status, response.ok);
 }
 
 export async function postEnvelope<T>(path: string, body: unknown = {}): Promise<T> {

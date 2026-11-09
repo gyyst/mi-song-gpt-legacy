@@ -300,8 +300,29 @@ export function registerVoiceCommandHandlers(
           account_id: target.accountId,
           device_id: target.device.device_id,
           device_name: target.device.device_name,
+          // outcome 由 MusicCommandService 处理完成后回填到 msg 上；
+          // dispatcher 异步路径下同步响应里拿不到，前端以 WS 补推帧为准
+          outcome: conversationMessage.outcome,
         },
       });
+    } catch (e: any) {
+      return jsonResponse({ success: false, error: e.message || String(e) });
+    }
+  });
+
+  // POST /voice-commands/qa-test - 测试问答接管链路（不打断音箱、不写历史）
+  router.post('/voice-commands/qa-test', async (req: HTTPRequest) => {
+    try {
+      const body = parseBody(req);
+      const query = body.query as string | undefined;
+
+      if (!query || typeof query !== 'string' || !query.trim()) {
+        return jsonResponse({ success: false, error: 'query is required' });
+      }
+
+      const start = Date.now();
+      const result = await voiceEngine.testQA(query);
+      return jsonResponse({ success: true, data: result, elapsed_ms: Date.now() - start });
     } catch (e: any) {
       return jsonResponse({ success: false, error: e.message || String(e) });
     }

@@ -16,11 +16,12 @@ import type {
   ScheduledTask,
   TaskLog,
   AIConfig,
+  QAConfig,
   PlaylistProgress,
   PlaylistProgressStore,
 } from '../types';
-import { DEFAULT_CHAT_CONFIG, readChatConfig, validateChatConfig } from '../chat/types';
-import type { ChatConfig } from '../chat/types';
+
+
 
 import { DEFAULT_MEMORY_MAX_RECORDS, normalizeMemoryMaxRecords } from '../memory/types';
 import { getDefaultVoiceCommands } from '../voicecmd/defaults';
@@ -33,6 +34,7 @@ const STORAGE_KEY_VOICE_COMMANDS = 'voice_commands';
 const STORAGE_KEY_SCHEDULED_TASKS = 'scheduled_tasks';
 const STORAGE_KEY_SCHEDULE_LOGS = 'schedule_logs';
 const STORAGE_KEY_AI_CONFIG = 'ai_config';
+const STORAGE_KEY_QA_CONFIG = 'qa_config';
 const STORAGE_KEY_SEARCH_PROVIDERS = 'search_provider_registry';
 const STORAGE_KEY_DEVICE_GROUPS = 'device_groups';
 const STORAGE_KEY_PLAYLIST_PROGRESS = 'playlist_progress';
@@ -83,6 +85,7 @@ function defaultPluginConfig(): PluginConfig {
     external_search_playlist_id: '',
     external_search_timeout: 6,
     external_search_no_import: false,
+    external_search_auto_continue: false,
     search_priority: 'parallel',
     indicator_light_enabled: true,
     default_cover_id: '1732418460076477549',
@@ -100,6 +103,8 @@ function defaultPluginConfig(): PluginConfig {
     hourly_chime_resume_enabled: false,
     max_song_index: 10000,
     ai_config: defaultAIConfig(),
+    qa_config: defaultQAConfig(),
+    play_mode_default_migrated: false,
   };
 }
 
@@ -113,6 +118,50 @@ function defaultAIConfig(): AIConfig {
     model: 'qwen-flash',
     timeout: 6,
   };
+}
+
+/** 默认 QA 问答接管配置 */
+function defaultQAConfig(): QAConfig {
+  return {
+    enabled: false,
+    api_url: 'https://ark.cn-beijing.volces.com/api/v3',
+    api_key: '',
+    model: '',
+    timeout: 30,
+    system_prompt: '你是一个智能音箱助手，请用简洁的口语回答用户的问题，每次回答控制在150字以内，不要使用 markdown、列表和特殊符号。',
+    thinking_notice: '正在思考，请稍等',
+    native_answer_wait_sec: 4,
+    web_search_enabled: false,
+    web_search_strategy: 'hybrid',
+    web_search_fallback_notice: '联网搜索暂时不可用，以下内容可能不是最新。',
+    max_reply_length: 100,
+    followup_seconds: 60,
+    memory_enabled: true,
+    context_turns: 12,
+    history_limit: 500,
+    history_days: 30,
+  };
+}
+
+/**
+ * 读取时按字段合并默认值并做轻量钳制。
+ * 旧版 qa_config 存储可能缺少新增字段（或带着已废弃的 history_max_length），
+ * load() 不做合并，必须在这里补齐，调用方才能拿到完整 schema。
+ * 只读合并不回写磁盘；用户下次保存时自然落盘。
+ */
+function mergeQAConfig(stored: Partial<QAConfig> | null | undefined): QAConfig {
+  const merged: QAConfig = { ...defaultQAConfig(), ...(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {}) };
+  merged.timeout = Math.max(1, Math.min(30, Math.round(Number(merged.timeout) || 30)));
+  merged.native_answer_wait_sec = Math.max(0, Math.min(10, Number(merged.native_answer_wait_sec) || 0));
+  merged.max_reply_length = Math.max(0, Math.min(500, Math.round(Number(merged.max_reply_length) || 0)));
+  merged.followup_seconds = Math.max(0, Math.min(300, Math.round(Number(merged.followup_seconds) || 0)));
+  merged.context_turns = Math.max(1, Math.min(24, Math.round(Number(merged.context_turns) || 12)));
+  merged.history_limit = Math.max(12, Math.min(500, Math.round(Number(merged.history_limit) || 500)));
+  merged.history_days = Math.max(1, Math.min(30, Math.round(Number(merged.history_days) || 30)));
+  if (merged.web_search_strategy !== 'auto' && merged.web_search_strategy !== 'hybrid')
+    merged.web_search_strategy = 'hybrid';
+  delete (merged as unknown as Record<string, unknown>).history_max_length;
+  return merged;
 }
 
 /**
@@ -140,28 +189,6 @@ export class ConfigManager {
   // 歌单进度表：每次切歌都要读改写，不缓存就是每首歌一次多余的 storage.get。
   // 与上面两个 key 同一套约定（缓存 in-flight Promise + 写穿透）。
   private playlistProgressCache: Promise<PlaylistProgressStore> | null = null;
-
-  private chatConfigWrite: Promise<unknown> = Promise.resolve();
-
-  async getChatConfig(): Promise<ChatConfig> {
-    await this.chatConfigWrite.catch(() => { });
-    const raw = await songloft.storage.get('chat_config:v1');
-    if (!raw) return validateChatConfig({});
-    try { return readChatConfig(JSON.parse(raw as string)); }
-    catch { throw new Error('AI 对话配置损坏，原配置已保留'); }
-  }
-
-  saveChatConfig(updates: Partial<ChatConfig>): Promise<ChatConfig> {
-    const pending = this.chatConfigWrite.catch(() => { }).then(async () => {
-      const raw = await songloft.storage.get('chat_config:v1');
-      const current = raw ? readChatConfig(JSON.parse(raw as string)) : DEFAULT_CHAT_CONFIG;
-      const next = validateChatConfig(updates, current);
-      await songloft.storage.set('chat_config:v1', JSON.stringify(next));
-      return next;
-    });
-    this.chatConfigWrite = pending;
-    return pending;
-  }
 
   // ===== 通用存储读写 =====
 
@@ -256,6 +283,44 @@ export class ConfigManager {
       }];
     }
     return [];
+  }
+
+  /**
+   * 一次性迁移：默认播放模式由「顺序播放」(order) 改为「列表循环」(loop)。
+   * 遍历所有账号的设备配置，把落盘的 play_mode === 'order' 翻成 'loop'，随后置位
+   * play_mode_default_migrated 落盘，此后启动不再执行——之后用户手动切回的「顺序播放」
+   * 不会被再次覆盖；无设备的新装同样置位。整体 try/catch，失败不阻塞插件初始化。
+   */
+  async migratePlayModeDefaultOnce(): Promise<void> {
+    try {
+      if (this.configCache === null) {
+        this.configCache = this.load<Partial<PluginConfig>>(STORAGE_KEY_CONFIG, {});
+      }
+      const stored = await this.configCache;
+      if (stored.play_mode_default_migrated) return;
+      const accounts = await this.getAccounts();
+      let flipped = 0;
+      for (const acc of accounts) {
+        const devs: DeviceConfig[] = acc.devices || [];
+        for (const dev of devs) {
+          if (dev.play_mode === 'order') {
+            dev.play_mode = 'loop';
+            flipped++;
+          }
+        }
+      }
+      if (flipped > 0) {
+        await this.saveAccounts(accounts);
+      }
+      const next = { ...stored, play_mode_default_migrated: true };
+      await this.save(STORAGE_KEY_CONFIG, next);
+      this.configCache = Promise.resolve(next);
+      if (flipped > 0) {
+        songloft.log.info('[Config] default play mode migration: ' + flipped + ' device(s) order -> loop');
+      }
+    } catch (e) {
+      songloft.log.warn('[Config] default play mode migration failed: ' + String(e));
+    }
   }
 
   /** 保存插件全局配置 */
@@ -536,6 +601,18 @@ export class ConfigManager {
   /** 保存 AI 配置 */
   async saveAIConfig(config: AIConfig): Promise<void> {
     await this.save(STORAGE_KEY_AI_CONFIG, config);
+  }
+
+  // ===== QA 问答接管配置 =====
+
+  /** 获取 QA 问答接管配置（读取时合并默认值并钳制，兼容缺字段的旧存储） */
+  async getQAConfig(): Promise<QAConfig> {
+    return mergeQAConfig(await this.load<Partial<QAConfig>>(STORAGE_KEY_QA_CONFIG, {}));
+  }
+
+  /** 保存 QA 问答接管配置 */
+  async saveQAConfig(config: QAConfig): Promise<void> {
+    await this.save(STORAGE_KEY_QA_CONFIG, config);
   }
 
   // ===== 定时任务 =====

@@ -1,12 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createServer } from 'node:http';
-import { load, storageOf, chatOf } from './chat_fixture.mjs';
+import { load, storageOf } from './chat_fixture.mjs';
 import { deferred, flush } from './chat_loader.mjs';
 const { AIClient } = load('../src/ai/client.ts');
 const { readResponsesStream, readResponsesText } = load('../src/ai/responses.ts');
-const { ConfigManager } = load('../src/config/manager.ts');
-const { validateChatConfig, chatConnection, readChatConfig } = load('../src/chat/types.ts');
 const { aiResponsesUrl } = load('../src/utils/ai_url.ts');
 const config = { enabled: true, api_protocol: 'responses', api_url: 'https://custom.test/v1', api_key: 'test-only', model: 'model', timeout: 5, custom_headers: { 'x-session': 'session-only' } };
 const message = text => ({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
@@ -24,15 +22,6 @@ for (const [base, expected] of [
   ['https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/responses'],
 ]) test('Responses URL ' + base, () => assert.equal(aiResponsesUrl(base), expected));
 
-test('protocol defaults and saved migration preserve existing connections', async t => {
-  storageOf(t);
-  const manager = new ConfigManager();
-  assert.equal(readChatConfig({}).api_protocol, 'chat_completions');
-  await manager.saveChatConfig({ api_protocol: 'responses' });
-  await manager.saveChatConfig({ model: 'custom' });
-  assert.equal((await new ConfigManager().getChatConfig()).api_protocol, 'responses');
-  for (const api_protocol of [null, true, '', 'auto']) assert.throws(() => validateChatConfig({ api_protocol }));
-});
 
 for (const kind of ['chat', 'summary', 'memory']) test('Responses wire format, headers and search isolation: ' + kind, async t => {
   storageOf(t);
@@ -67,22 +56,6 @@ test('Responses search disabled adds no tools, including official DashScope', as
   await new AIClient().request({ ...config, api_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen3.7-flash' }, [], 'chat');
 });
 
-for (const connection of ['analysis', 'independent']) test('saved protocol reaches actual chat request: ' + connection, async t => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const h = chatOf(t, { config: { connection, ...config, web_search_enabled: true } });
-  h.config.getAIConfig = async () => ({ ...config, api_protocol: undefined });
-  assert.equal(chatConnection(await h.config.getChatConfig(), await h.config.getAIConfig()).api_protocol, 'responses');
-  h.chat.client = new AIClient();
-  t.mock.method(globalThis, 'fetch', async (url, init) => {
-    assert.match(url, /\/responses$/);
-    assert.deepEqual(JSON.parse(init.body).tools, [{ type: 'web_search' }]);
-    return Response.json(response());
-  });
-  await h.chat.submit('a', 'd', '今天天气', false);
-  t.mock.timers.tick(0); await flush();
-  assert.equal(h.chat.status('a', 'd').phase, 'completed');
-  assert.equal(h.chat.status('a', 'd').answer, '回答');
-});
 
 for (const [name, value, expected] of [
   ['assistant only', { status: 'completed', output: [{ type: 'reasoning', content: [{ type: 'output_text', text: '秘密' }] }, { ...message('用户'), role: 'user' }, { type: 'web_search_call', status: 'completed' }, message('正文')] }, '正文'],
@@ -185,32 +158,6 @@ for (const contentType of ['application/json', 'text/event-stream']) test('real 
   assert.equal(calls, 2);
 });
 
-for (const terminal of ['completed', 'incomplete', 'failed']) test('Responses chat lifecycle and TTS: ' + terminal, async t => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const h = chatOf(t, { config: { ...config, web_search_enabled: true } });
-  const wait = deferred();
-  let reads = 0, cancelled = false;
-  songloft.net = {
-    httpStream() {
-      return {
-        response: Promise.resolve({ status: 200, headers: { 'Content-Type': ['text/event-stream'] } }),
-        read: async () => ++reads === 1 ? encode(delta('部分回答')) : wait.promise,
-        cancel: async () => { cancelled = true; }
-      };
-    }
-  };
-  h.chat.client = new AIClient();
-  await h.chat.submit('a', 'd', '测试');
-  t.mock.timers.tick(0); await flush();
-  assert.equal(h.chat.status('a', 'd').answer, '部分回答');
-  assert.ok(!h.calls.some(call => call[0] === 'speak'));
-  wait.resolve(encode(terminal === 'completed' ? complete('完整回答') : event({ type: 'response.' + terminal, response: { status: terminal } })));
-  await flush();
-  assert.equal(h.chat.status('a', 'd').phase, terminal === 'completed' ? 'completed' : 'failed');
-  assert.equal(h.chat.status('a', 'd').answer, terminal === 'completed' ? '完整回答' : '部分回答');
-  assert.deepEqual(h.calls.filter(call => call[0] === 'speak').map(call => call[2]), [terminal === 'completed' ? '完整回答' : '抱歉，暂时无法回答，请稍后再试。']);
-  assert.equal(cancelled, true);
-});
 
 test('Responses timeout cancels the active upstream without retrying', async t => {
   storageOf(t);

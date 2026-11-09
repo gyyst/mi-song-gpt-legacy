@@ -18,7 +18,11 @@ const CLOCK_SKEW_WARN_MS = 5 * 60 * 1000;
 // ===== 类型定义 =====
 
 /** 内部回调函数类型 */
-export type ConversationCallback = (msg: ConversationMessage) => void | Promise<void>;
+/**
+ * 对话回调。返回 VoiceOutcome（由 voice_engine 回调产生）时，
+ * notifyCallbacks 会把来源回填进缓冲区的消息对象，供对话记录 UI 展示路由结果。
+ */
+export type ConversationCallback = (msg: ConversationMessage) => void | Promise<void | import('../types').VoiceOutcome>;
 
 /** 设备监听状态 */
 interface DeviceMonitorState {
@@ -149,10 +153,6 @@ export class ConversationMonitor {
       const intervalSec = Number.isFinite(configuredInterval)
         ? Math.max(1, Math.min(30, configuredInterval)) : 2;
       this.pollInterval = intervalSec * 1000;
-      const chatRevision = this.chatRevision;
-      const chatConfig = await this.configManager.getChatConfig?.().catch(() => null);
-      if (chatRevision === this.chatRevision) this.chatEnabled = !!chatConfig?.enabled;
-      if (!this.isCurrent(generation)) return;
 
       // 等待设备列表刷新完成，确保 getStatus() 能读到真实设备数
       await this.refreshDevices(generation);
@@ -261,6 +261,10 @@ export class ConversationMonitor {
     if (limit > 0 && result.length > limit) {
       result = result.slice(result.length - limit);
     }
+
+    // 返回副本并按时间降序（最新在前）：前端「最近对话记录」与 WS 快照都按此渲染，
+    // 与实时增量推送 unshift 到顶部的顺序保持一致，否则点「刷新记录」会变回时间升序
+    result = result.slice().sort((a, b) => b.message.timestamp_ms - a.message.timestamp_ms);
 
     songloft.log.info(`[ConversationMonitor] getMessages total_stored=${this.messages.length} returning=${result.length} (limit=${limit} sinceTs=${sinceTimestampMs})`);
     return result;

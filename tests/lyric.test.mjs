@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { loader } from './chat_loader.mjs';
+import { loader, loadSdk } from './chat_loader.mjs';
 
 function fixture(t, fetchHost) {
   const requests = [], warnings = [];
@@ -15,7 +15,7 @@ function fixture(t, fetchHost) {
   };
   t.after(() => Object.assign(globalThis, previous));
   const load = loader();
-  const { createRouter } = load('../../../toolchain/packages/plugin-sdk/src/index.ts');
+  const { createRouter } = loadSdk();
   const router = createRouter();
   load('../src/handlers/lyric.ts').registerLyricHandlers(router);
   return {

@@ -3,7 +3,6 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import AppBar from './AppBar.vue';
 import DeviceSettings from './settings/DeviceSettings.vue';
 import PlaybackSettings from './settings/PlaybackSettings.vue';
-import AISettings from './settings/AISettings.vue';
 import VoiceSettings from './settings/VoiceSettings.vue';
 import ScheduleSettings from './settings/ScheduleSettings.vue';
 import ToolboxSettings from './settings/ToolboxSettings.vue';
@@ -17,12 +16,11 @@ const isNarrow = ref(typeof window !== 'undefined' && window.innerWidth < 600);
 const categories = [
   { id: 'device', title: '设备', subtitle: '服务器、账号和设备分组', icon: 'speaker_group', component: DeviceSettings },
   { id: 'playback', title: '播放', subtitle: '格式、音量和触屏显示', icon: 'music_note', component: PlaybackSettings },
-  { id: 'voice', title: '语音', subtitle: '监听、口令和搜索', icon: 'record_voice_over', component: VoiceSettings },
-  { id: 'ai', title: 'AI 设置', subtitle: '模型连接、口令分析、对话与记忆', icon: 'auto_awesome', component: AISettings },
+  { id: 'voice', title: '语音', subtitle: '监听、口令、搜索与 AI', icon: 'record_voice_over', component: VoiceSettings },
   { id: 'schedule', title: '定时', subtitle: '调度规则和执行日志', icon: 'schedule', component: ScheduleSettings },
   { id: 'toolbox', title: '工具箱', subtitle: 'URL、TTS 和操作结果', icon: 'construction', component: ToolboxSettings },
 ];
-const currentCategory = computed(() => categories.find((category) => category.id === (navigation.settingsCategory === 'chat' ? 'ai' : navigation.settingsCategory || 'device')) || categories[0]);
+const currentCategory = computed(() => categories.find((category) => category.id === (navigation.settingsCategory || 'device')) || categories[0]);
 const managedDeviceCount = computed(() => state.devices.reduce(
   (total, account) => total + account.devices.filter((device) => device.managed).length,
   0,
@@ -35,7 +33,7 @@ function categorySubtitle(category: (typeof categories)[number]): string {
       : category.subtitle;
   }
   if (category.id === 'voice') {
-    return state.config.conversation_monitor_enabled ? '监听运行中 · 口令与智能搜索' : category.subtitle;
+    return state.config.conversation_monitor_enabled ? '监听运行中 · 口令、搜索与 AI' : category.subtitle;
   }
   if (category.id === 'schedule') {
     return state.schedules.length ? `${state.schedules.length} 个任务 · ${state.config.scheduled_tasks_enabled ? '已启用' : '已暂停'}` : category.subtitle;

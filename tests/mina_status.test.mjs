@@ -423,32 +423,3 @@ test('non-TTS timeout keeps the existing control failure semantics', async () =>
   });
 });
 
-test('real Mina service and speech polling confirm a timed-out TTS using shared fresh samples', async t => {
-  const { SpeechService } = loadSource('../src/chat/speech.ts', {});
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  await withClient(async h => {
-    h.service.getDeviceIdentity = async () => ({ hardware: '', miotDID: '' });
-    let statusQueries = 0;
-    h.setFetch(async r => response(200, r.method === 'text_to_speech'
-      ? { code: 101, data: { device_data: '{"code":3012}' } }
-      : { code: 0, data: { info: JSON.stringify({ status: ++statusQueries === 1 ? 1 : 0 }) } }));
-    const speech = new SpeechService(h.service);
-    let result;
-    const pending = speech.speak('短回答', { account: 'account', device: 'speaker', isCurrent: () => true }).then(value => { result = value; });
-    await flush();
-    for (let i = 0; i < 10; i++) {
-      h.advance(1000);
-      t.mock.timers.tick(1000);
-      await flush();
-    }
-    assert.equal(result, undefined, 'a cached idle sample must not count twice');
-    h.advance(1000);
-    t.mock.timers.tick(1000);
-    await flush();
-    await pending;
-    assert.equal(result, 'completed');
-    assert.equal(h.requests.filter(r => r.method === 'text_to_speech').length, 1);
-    assert.equal(h.requests.filter(r => r.method === 'player_play_tts').length, 0);
-    assert.equal(statusQueries, 3);
-  });
-});

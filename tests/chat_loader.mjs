@@ -18,7 +18,7 @@ export function loader(overrides = {}) {
       if (Object.hasOwn(overrides, name))
         return overrides[name];
       if (name === '@songloft/plugin-sdk')
-        return load('../../../toolchain/packages/plugin-sdk/src/index.ts');
+        return loadSdk();
       if (!name.startsWith('.'))
         return require(name);
       const base = resolve(dirname(path), name);
@@ -31,6 +31,12 @@ export function loader(overrides = {}) {
   }
   return load;
 }
+// 上游 monorepo 期望 ../../toolchain 源码；单仓布局下回退 node_modules 的 @songloft/plugin-sdk（CJS 构建）
+export function loadSdk() {
+  const src = resolve(dirname(fileURLToPath(import.meta.url)), '../../../toolchain/packages/plugin-sdk/src/index.ts');
+  return existsSync(src) ? loader()(src) : createRequire(import.meta.url)('@songloft/plugin-sdk');
+}
+
 export async function flush() {
   for (let i = 0; i < 80; i++)
     await Promise.resolve();

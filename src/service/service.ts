@@ -10,7 +10,7 @@ import { MinaAuth } from '../mina/auth';
 import { MinaHTTPClient } from '../mina/client';
 import type { PlayMetadata, StatusQueryOptions } from '../mina/client';
 import { getTTSCommand, XIAOMI_IO_SID, LoginState } from '../mina/constants';
-import type { DeviceConfig, MinaDevice } from '../types';
+import type { AskMessage, DeviceConfig, MinaDevice } from '../types';
 
 // ===== 导出类型 =====
 
@@ -226,6 +226,25 @@ export class MinaService {
     } catch (e) {
       songloft.log.error('[MinaService] stopPlay failed: ' + String(e));
       return false;
+    }
+  }
+
+  /**
+   * 获取最新的对话记录（QA 问答接管等待小爱原生回答时使用）
+   * @returns 记录数组；取记录失败返回 null（与 getLatestAskFromXiaoai 语义一致）
+   */
+  async getLatestAsk(accountId: string, deviceId: string, limit = 2): Promise<AskMessage[] | null> {
+    const client = this.getClient(accountId);
+    if (!client) {
+      return null;
+    }
+
+    try {
+      const hardware = await this.getDeviceHardware(client, deviceId);
+      return await client.getLatestAskFromXiaoai(deviceId, hardware, limit);
+    } catch (e) {
+      songloft.log.warn('[MinaService] getLatestAsk failed: ' + String(e));
+      return null;
     }
   }
 
@@ -639,7 +658,7 @@ export class MinaService {
         presence: apiDev.presence || 'offline',
         managed: local?.managed ?? true,
         volume: local?.volume ?? 0,
-        play_mode: local?.play_mode ?? 'order',
+        play_mode: local?.play_mode ?? 'loop',
         playlist_id: local?.playlist_id ?? 0,
         current_song_index: local?.current_song_index ?? 0,
         last_selected_at: local?.last_selected_at ?? '',

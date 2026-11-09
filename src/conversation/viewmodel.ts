@@ -18,6 +18,12 @@ export interface ConversationViewModel {
   device_name: string;
   query: string;
   answer: string;
+  /** 语音引擎处理来源（rule/memory/search/ai/xiaoai/llm），未处理时缺省 */
+  outcome?: string;
+  /** 来源补充说明（命中口令/AI 动作等），UI 悬浮提示用 */
+  outcome_detail?: string;
+  /** 判定反馈与分阶段耗时（UI「最近对话记录」meta 行） */
+  outcome_meta?: import('../types').OutcomeMeta;
 }
 
 /**
@@ -38,5 +44,8 @@ export function toConversationViewModel(msg: ConversationMessage): ConversationV
     device_name: msg.device_name,
     query: ans?.question || ans?.intention?.query || '',
     answer: ans?.content || '',
+    outcome: msg.outcome,
+    outcome_detail: msg.outcome_detail,
+    outcome_meta: msg.outcome_meta,
   };
 }

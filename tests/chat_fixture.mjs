@@ -1,61 +1,45 @@
+import assert from 'node:assert/strict';
 import { loader } from './chat_loader.mjs';
 export const load = loader();
-export const { DEFAULT_CHAT_CONFIG, validateChatConfig, chatConnection, chatScope } = load('../src/chat/types.ts');
-export const { AIChatService } = load('../src/chat/service.ts');
-export const { PlaybackCoordinator } = load('../src/playback/coordinator.ts');
-export const { ChatMemoryService } = load('../src/chat/memory.ts');
-export const configOf = (updates = {}) => ({ ...DEFAULT_CHAT_CONFIG, enabled: true, waiting_feedback: false, memory_enabled: false, context_turns: 12, summary_enabled: true, connection: 'independent', api_url: 'https://example.test/v1', api_key: 'test-only', model: 'model', ...updates });
+export const { accountScope, qaConnection, ChatMemoryService } = load('../src/chat/memory.ts');
+export const { VoiceDispatcher } = load('../src/voicecmd/dispatcher.ts');
+
+/** 完整 QAConfig（与 src/config/manager.ts 的 defaultQAConfig 对齐） */
+export const qaConfigOf = (updates = {}) => ({
+  enabled: true, api_url: 'https://example.test/v1', api_key: 'test-only', model: 'model', timeout: 30,
+  system_prompt: '你是音箱助手', thinking_notice: '', native_answer_wait_sec: 0, web_search_enabled: false,
+  web_search_strategy: 'hybrid', web_search_fallback_notice: '', max_reply_length: 0, followup_seconds: 60,
+  memory_enabled: false, context_turns: 12, history_limit: 500, history_days: 30, ...updates,
+});
 export const turnOf = (id, updates = {}) => ({ id, user: `问题${id}`, assistant: `答案${id}`, phase: 'completed', created_at: Date.now(), ...updates });
+export const snapshotOf = (updates = {}) => ({ version: 1, revision: 0, context_since: 0, history: [], summary: '', summary_sources: [], extracted_sources: [], memories: [], ...updates });
+
 export function storageOf(t) {
   const previous = globalThis.songloft, values = new Map(), logs = [];
   globalThis.songloft = { log: Object.fromEntries(['info', 'warn', 'error'].map(level => [level, text => logs.push([level, text])])), storage: { get: async (key) => values.get(key) ?? null, set: async (key, value) => { values.set(key, value); } } };
   t.after(() => { globalThis.songloft = previous; });
   return { values, logs };
 }
-export function chatOf(t, options = {}) {
-  const storage = storageOf(t), calls = [], listeners = [];
-  let config = configOf(options.config), revision = 1, state = options.state || 'playing', guard;
-  const manager = {
-    getPosition: () => 43, getInteractionPosition: () => 43, getPlaybackRevision: () => revision,
-    isPlaying: () => state === 'playing', getStatus: () => ({ state }), isExternalPlayback: () => options.external || false,
-    setInteractionGuard(callback) {
-      guard = callback;
-      return () => {
-        if (guard === callback)
-          guard = undefined;
-      };
+
+/** 新版派发器（music + players 两参）；music.handleMessage 返回 handled 决定是否 resumeUnmatched */
+export function dispatcherOf(t, { fixed, handled = false, throwing = false, managers = new Map() } = {}) {
+  const calls = [];
+  const pending = [];
+  const music = {
+    cancelPendingResume(account, device) { pending.push(['cancel-pending', account, device]); },
+    fixedControlType: async () => fixed,
+    hasFixedControl: async () => false,
+    handleMessage: async (message, options) => {
+      calls.push(['music', message.message.response.answer[0].question]);
+      assert.ok(options.deferResume, 'dispatch 必须 deferResume');
+      if (throwing)
+        throw new Error('music failed');
+      return handled;
     },
-    cancelHourlyResume() { calls.push('cancel-hourly'); }, reserveForVoiceInteraction() { revision++; calls.push('reserve'); },
-    async replayCurrent(position, current) {
-      calls.push(['resume', position]);
-      if (!current())
-        return false;
-      revision++;
-      state = 'playing';
-      return options.resumeResult ?? true;
-    },
-    async holdAfterInteraction(position) { calls.push(['hold', position]); revision++; state = 'paused'; },
+    resumeUnmatched: (account, device) => calls.push(['resume', account, device]),
   };
-  let control;
-  const devices = {
-    setOnControl(callback) { control = callback; },
-    async stopForInteraction(account, device, current) { calls.push(['pause', device]); return current() ? (options.pauseResult?.[device] || 'stopped') : 'cancelled'; },
-    async interruptAnswer(account, device, current) { calls.push(['interrupt', device]); return { status: current() ? options.interruptResult || (options.pauseResult?.[device] === 'failed' ? 'failed' : 'accepted') : 'cancelled' }; },
-    async textToSpeech(account, device, text, current) { calls.push(['tts', device, text]); return current(); },
-    async getPlayState() { return { status: 0, sampledAt: Date.now() }; },
-  };
-  const configuration = { getChatConfig: async () => config, getAIConfig: async () => ({ enabled: false, api_url: 'https://analysis.test/v1', api_key: 'analysis-only', model: 'analysis' }), findDeviceGroup: async () => options.group ? { members: [{ account_id: 'a', device_id: 'd' }, { account_id: 'a', device_id: 'e' }] } : null };
-  const playback = new PlaybackCoordinator({ get: () => options.noManager ? null : manager }, devices, configuration);
-  const speech = options.speech || {
-    async speak(text, token, current) { calls.push(['speak', token.device, text]); return current() ? options.speechResult || 'completed' : 'cancelled'; }, async stop(token) {
-      calls.push(['stop-answer', token.device]);
-      if (options.stopError)
-        throw new Error('停止失败');
-    }
-  };
-  const chat = new AIChatService(configuration, playback, speech);
-  chat.client.request = options.request || (async (_config, _messages, kind) => kind === 'chat' ? '测试答案' : kind === 'summary' ? '测试摘要' : '[]');
-  chat.subscribe((scope, status) => listeners.push({ scope, ...status }));
-  t.after(() => chat.close());
-  return { ...storage, chat, playback, manager, devices, config: configuration, calls, listeners, setConfig: updates => { config = configOf(updates); }, control: (device = 'd') => control('a', device), invalidate: () => guard?.(), state: () => state };
+  const players = { get: (a, d) => managers.get(`${a}:${d}`) || null };
+  const dispatcher = new VoiceDispatcher(music, players);
+  t.after(() => dispatcher.close());
+  return { dispatcher, calls, pending, music, send(text, device = 'd', id = text) { dispatcher.submit({ account_id: 'a', device_id: device, message: { request_id: id, timestamp_ms: 1, response: { answer: [{ question: text }] } } }); } };
 }

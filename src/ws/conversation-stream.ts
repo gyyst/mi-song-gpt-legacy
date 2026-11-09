@@ -1,7 +1,7 @@
 // MIoT 智能音箱插件 - 对话记录 WebSocket 推送
 //
 // 用长连接推送替代前端每 2 秒 HTTP 轮询 `/conversation/messages`：
-//   - 前端订阅 `wss?://.../api/v1/jsplugin/miot/conversation/ws?access_token=..&limit=50`
+//   - 前端订阅 `wss?://.../api/v1/jsplugin/<entryPath>/conversation/ws?access_token=..&limit=50`
 //   - 所有订阅者共享一份对话缓冲：建连先推一帧快照（最近 N 条），随后有新对话即增量推送
 //   - 复用 ConversationMonitor 的观察者回调：monitor 每 tick 检测到新消息即触发回调，
 //     无需额外定时器，也不额外增加对云端的轮询压力
@@ -36,6 +36,16 @@ let callbackRegistered = false;
 /** 在 onInit 中注入依赖（懒加载恢复时也需重新调用） */
 export function initConversationStream(cm: ConversationMonitor): void {
   conversationMonitor = cm;
+}
+
+/**
+ * 语音引擎处理完成后（msg.outcome 已回填）补推一帧。
+ * dispatcher 是异步派发，monitor 的增量帧先于 outcome 到达前端；
+ * 这里在 outcome 落定后再推一帧同形状的 message 帧，前端按 id upsert（mi-song-gpt）。
+ */
+export function notifyConversationOutcome(msg: ConversationMessage): void {
+  if (sockets.size === 0) return;
+  broadcast({ type: 'message', data: toConversationViewModel(msg) });
 }
 
 /** 向所有在线订阅者广播一帧 */

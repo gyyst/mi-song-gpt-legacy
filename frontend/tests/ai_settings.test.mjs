@@ -13,7 +13,7 @@ function harness(options = {}) {
   const state = { config: { voice_command_enabled: false, ai_config: { enabled: false, api_url: 'https://old.test/v1', api_key: 'test-only', model: 'old', timeout: 6 } } };
   const calls = [], notifications = [], watchers = [];
   let mounted, unmounted;
-  const source = fs.readFileSync(new URL('../src/views/settings/AIModelSettings.vue', import.meta.url), 'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*;\n/gm, '');
+  const source = fs.readFileSync(new URL('../src/views/settings/AIModelSettings.vue', import.meta.url), 'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/\r\n/g, '\n').replace(/^import .*;\n/gm, '');
   const env = {
     parseAIHeaders, state, navigation: { settingsCategory: '' }, AI_PRESET_PROVIDERS: [{ id: 'preset', name: '测试模型服务商', baseUrl: 'https://preset.test/v1', defaultModel: 'preset-model', apiKeyUrl: 'https://preset.test/key' }],
     ref: value => ({ value }), computed: fn => ({ get value() { return fn(); } }), watch: (_get, callback) => watchers.push(callback), onMounted: fn => { mounted = fn; }, onUnmounted: fn => { unmounted = fn; },
@@ -128,16 +128,24 @@ test('failed save prevents model and analysis requests and reports errors', asyn
   assert.equal(h.loading.value, false);
   assert.equal(h.testResult.value, '保存失败');
 });
-test('all AI configuration has one settings entry; voice page retains the shortcut and search', () => {
+test('AI configuration lives inside the voice page AI card; no separate settings entry', () => {
   const root = fs.readFileSync(new URL('../src/views/SettingsPage.vue', import.meta.url), 'utf8');
   const page = fs.readFileSync(new URL('../src/views/settings/AISettings.vue', import.meta.url), 'utf8');
   const voice = fs.readFileSync(new URL('../src/views/settings/VoiceSettings.vue', import.meta.url), 'utf8');
-  assert.match(root, /id: 'ai', title: 'AI 设置'/);
-  assert.doesNotMatch(root, /id: 'chat',/);
+  assert.doesNotMatch(root, /id: 'ai'/);
+  assert.doesNotMatch(root, /AISettings/);
   assert.match(page, /<AIModelSettings/);
-  assert.match(page, /<ChatSettings/);
-  assert.doesNotMatch(voice, /\/voice-commands\/models|AI_PRESET_PROVIDERS/);
-  assert.match(voice, /打开 AI 设置/);
+  assert.doesNotMatch(page, /ChatSettings/);
+  assert.match(page, /<slot \/>/);
+  assert.match(voice, /<AISettings/);
+  assert.match(voice, /用户记忆/);
+  assert.match(voice, /追问窗口/);
+  const template = voice.slice(voice.indexOf('<template>'));
+  assert.ok(template.indexOf('setQAEnabled') > template.indexOf('<AISettings') && template.indexOf('setQAEnabled') < template.indexOf('</AISettings>'), 'QA takeover UI must live inside the AI card');
+  assert.doesNotMatch(voice, /打开 AI 设置/);
+  assert.doesNotMatch(voice, /settingsCategory = 'ai'/);
+  assert.doesNotMatch(voice, /AI_PRESET_PROVIDERS|refreshModels/);
+  assert.equal((voice.match(/\/voice-commands\/models/g) || []).length, 1, 'voice page probes connectivity exactly once');
   assert.match(voice, /external_search_playlist_id/);
 });
 test('analysis result is ignored after changing the model during the request', async () => {

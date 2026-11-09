@@ -1,0 +1,189 @@
+name: Sync Upstream
+
+# 定期把官方上游 songloft-plugin-miot 的 main 合入本仓库 main：
+#   1. 拉取上游，没有新提交则直接结束；
+#   2. 直接 git merge 上游 main（本仓库与上游历史共享祖先）；
+#   3. 合并后执行 typecheck / 单元测试 / 前端与插件构建校验，全部通过才推送 main；
+#   4. 合并冲突或校验失败时不改动 main，并自动创建/更新 issue 提醒人工处理。
+#
+# 说明：
+# - 使用内置 GITHUB_TOKEN 推送，由它触发的 push 不会再次触发其他 workflow；
+#   若后续需要 main 更新联动其他流水线，可改用 PAT secret。
+# - 定时任务使用 UTC：02:00 UTC = 北京时间 10:00。
+# - 同步进度记录在 .github/upstream-sync-state.json，由脚本自动维护。
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/songloft-org/songloft-plugin-miot.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Sync upstream
+        id: sync
+        run: bash scripts/sync-upstream.sh --abort-on-conflict
+
+      - name: Validate merged tree
+        id: validate
+        if: steps.sync.outputs.has_updates == 'true'
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          cd frontend
+          npm ci
+          npx vite build
+          cd ..
+          npm run build
+          npm run validate
+
+      - name: Push main
+        id: push
+        if: steps.sync.outputs.has_updates == 'true'
+        run: |
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" != "${{ steps.sync.outputs.base_sha }}" ]; then
+            echo "::error::main 在同步期间被其他提交更新，本次不推送，请重跑"
+            exit 1
+          fi
+          git push origin HEAD:main
+          echo "已推送同步提交到 main"
+
+      - name: Close previous failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TITLE="[upstream-sync] 上游自动合入失败"
+          NUMBER="$(gh issue list --state open --limit 100 --json number,title \
+            --jq "[.[] | select(.title == \"${TITLE}\")][0].number // empty")"
+          if [ -n "$NUMBER" ]; then
+            UPSTREAM_SHA="$(node -p "require('./.github/upstream-sync-state.json').lastSyncedSha")"
+            gh issue comment "$NUMBER" --body "当前已与上游 ${UPSTREAM_SHA:0:7} 同步，自动关闭。"
+            gh issue close "$NUMBER"
+          fi
+
+      - name: Report failure
+        if: failure() && (steps.sync.outcome != 'success' || steps.validate.outcome == 'failure' || steps.push.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SYNC_OUTCOME: ${{ steps.sync.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+        run: |
+          TITLE="[upstream-sync] 上游自动合入失败"
+
+          UPSTREAM_SHA="unknown"
+          if [ -f .git/upstream-sync-pending.json ]; then
+            UPSTREAM_SHA="$(node -p "require('./.git/upstream-sync-pending.json').upstreamSha" 2>/dev/null || echo unknown)"
+          elif [ -f .github/upstream-sync-state.json ]; then
+            UPSTREAM_SHA="$(node -p "require('./.github/upstream-sync-state.json').lastSyncedSha" 2>/dev/null || echo unknown)"
+          fi
+
+          CONFLICT_FILES=""
+          if [ -f .git/upstream-sync-conflicts ]; then
+            CONFLICT_FILES="$(cat .git/upstream-sync-conflicts)"
+          fi
+
+          if [ -n "$CONFLICT_FILES" ]; then
+            REASON="上游合并存在冲突，已中止，main 未改动。"
+            REASON_CODE="conflict"
+          elif [ "$VALIDATE_OUTCOME" = "failure" ]; then
+            REASON="合并成功，但 typecheck / 单元测试 / 构建校验未通过，main 未改动。"
+            REASON_CODE="validate"
+          elif [ "$PUSH_OUTCOME" = "failure" ]; then
+            REASON="校验通过，但推送 main 失败（main 可能已被其他提交更新）。"
+            REASON_CODE="push"
+          elif [ "$SYNC_OUTCOME" = "failure" ]; then
+            REASON="同步脚本执行失败（状态文件、网络或仓库状态异常），main 未改动。"
+            REASON_CODE="sync"
+          else
+            REASON="工作流执行失败，请查看运行日志。"
+            REASON_CODE="other"
+          fi
+
+          CONFLICT_SECTION=""
+          if [ -n "$CONFLICT_FILES" ]; then
+            CONFLICT_SECTION="$(printf '\n冲突文件：\n\n```\n%s\n```\n' "$CONFLICT_FILES")"
+          fi
+
+          BODY="$(printf '%s\n' \
+            '自动同步上游失败，需要人工处理。' \
+            '' \
+            "- 上游：${UPSTREAM_REPO}@${UPSTREAM_BRANCH}（\`${UPSTREAM_SHA}\`）" \
+            "- 原因：${REASON}" \
+            "${CONFLICT_SECTION}" \
+            "- 运行记录：${RUN_URL}" \
+            '' \
+            '本地处理方式：' \
+            '' \
+            '```bash' \
+            'git pull --ff-only' \
+            'bash scripts/sync-upstream.sh          # 冲突时保留现场' \
+            '# 解决冲突后：' \
+            'git add <冲突文件> && git commit' \
+            'bash scripts/sync-upstream.sh --continue' \
+            '# 本地验证（与 Action 一致）：' \
+            'npm ci && npm run typecheck && npm test && (cd frontend && npm ci && npx vite build) && npm run build && npm run validate' \
+            'git push origin main' \
+            '```' \
+            "<!-- upstream-sync:${UPSTREAM_SHA}:${REASON_CODE} -->")"
+
+          NUMBER="$(gh issue list --state open --limit 100 --json number,title \
+            --jq "[.[] | select(.title == \"${TITLE}\")][0].number // empty")"
+          if [ -n "$NUMBER" ]; then
+            LAST_REPORT="$(gh issue view "$NUMBER" --json body,comments \
+              --jq '([.body] + [.comments[].body]) | map(select(. != null)) | last // ""')"
+            MARKER="<!-- upstream-sync:${UPSTREAM_SHA}:${REASON_CODE} -->"
+            if printf '%s' "$LAST_REPORT" | grep -qF "$MARKER"; then
+              echo "issue #${NUMBER} 已上报相同状态，跳过重复评论"
+            else
+              gh issue comment "$NUMBER" --body "$BODY"
+              echo "已更新 issue #${NUMBER}"
+            fi
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+            echo "已创建 issue"
+          fi
+
+          {
+            echo "### 上游同步失败"
+            echo "${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"

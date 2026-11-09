@@ -399,8 +399,7 @@ async function cancelSleepTimer(): Promise<void> {
       <!-- 右侧：工具栏。胶囊档与「放不下」时把次要操作收进「更多」菜单 -->
       <div ref="toolsRef" class="player-bar-tools" @click.stop>
         <PlayerModePopup
-          v-if="!showInlinePlayMode"
-          :model-value="state.player.play_mode || 'order'"
+          :model-value="state.player.play_mode || 'loop'"
           popup-id="bar-mode"
           :disabled="state.playerBusy"
           @change="setPlayMode"

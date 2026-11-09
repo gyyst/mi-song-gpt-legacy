@@ -412,3 +412,28 @@ test('starting an enabled monitor with all devices in flight does not reset its 
     assert.equal(h.timers.size, 1);
   });
 });
+
+
+test('newest-first cloud batch is delivered to callbacks in ascending timestamp order', async () => {
+  await withMonitor(async h => {
+    h.setDevices(['a']);
+    h.setConfig(async () => ({}));
+    h.setRequest(async () => [message(100)]);
+    await h.monitor.start();
+    // 首轮建立基线，不投递
+    assert.equal(h.monitor.getMessages().length, 0);
+
+    const seen = [];
+    h.monitor.registerCallback('test', msg => { seen.push(msg.message.timestamp_ms); });
+    // 模拟云端 newest-first 返回的一批新消息（乱序到达）
+    h.setRequest(async () => [message(300), message(200), message(250)]);
+    await h.advance(2000);
+
+    assert.deepEqual(seen, [200, 250, 300], 'notify 回调必须按时间升序投递');
+    assert.deepEqual(
+      h.monitor.getMessages().map(m => m.message.timestamp_ms),
+      [300, 250, 200],
+      'getMessages 必须按时间降序返回',
+    );
+  });
+});

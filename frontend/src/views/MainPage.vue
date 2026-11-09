@@ -363,7 +363,7 @@ onUnmounted(() => {
 <template>
   <div class="miot-main-appbar">
     <div class="miot-main-appbar-inner">
-      <AppBar title="MIoT 智能音箱" :subtitle="state.deviceConnecting ? '正在连接音箱…' : currentDevice ? `${deviceName(currentDevice)} · ${state.player.is_playing ? '播放中' : '待机'}` : '请选择播放设备'">
+      <AppBar title="mi-song-gpt" :subtitle="state.deviceConnecting ? '正在连接音箱…' : currentDevice ? `${deviceName(currentDevice)} · ${state.player.is_playing ? '播放中' : '待机'}` : '请选择播放设备'">
         <SlButton variant="icon" icon="speaker_group" title="选择设备" @click="openDevicePicker" />
         <SlButton variant="icon" icon="refresh" title="刷新" :disabled="state.refreshing" @click="refreshAll" />
         <SlButton variant="icon" icon="settings" title="设置" @click="openPage('settings')" />

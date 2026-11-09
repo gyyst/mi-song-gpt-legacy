@@ -32,6 +32,11 @@ export interface OnlineSearchResult {
   dedup_key?: string;
   lyric?: string;
   lyric_source?: string;
+  /**
+   * 可选：provider 返回的同批候选（topone 扩展，如 lxmusic 会带 top10）。
+   * 自动连播优先从这里挑其他歌曲，避免为一首歌反复发搜索请求。
+   */
+  candidates?: OnlineSearchResult[];
 }
 
 // 外部搜索 API 响应
@@ -72,6 +77,28 @@ interface RemoteSongsResponse {
     source_data: string;
     dedup_key: string;
   }>;
+}
+
+/** 单次自动连播补充的歌曲数：补一次够播一阵，同时避免一次导入太多歌 */
+const AUTO_CONTINUE_BATCH = 3;
+/** 每次补充最多新发几条搜索：外部搜索单条超时可达 6s，不能无限试 */
+const AUTO_CONTINUE_SEARCH_ATTEMPTS = 2;
+
+/**
+ * 一次「单曲播完自动连播」链路的上下文。
+ * 由 startAutoContinue 创建，闭包持有的 PlaylistManager 队列播完时通过
+ * queueRefillHook 回调取歌。
+ */
+interface AutoContinueState {
+  pm: PlaylistManager;
+  indexingManager?: IndexingManager;
+  generation: number;          // 创建时的队列代数，换队列后旧链路自动失效
+  title: string;
+  artist: string;
+  played: Set<string>;         // 本链路已入队歌曲的 title|artist 归一化键
+  pending: OnlineSearchResult[]; // 原搜索响应附带的候选，优先消费
+  queries: string[];           // 后续搜索的派生关键词，按顺序消耗
+  active: boolean;
 }
 
 /**
@@ -377,13 +404,13 @@ export class OnlineSearcher {
     // 开始，播完后由 PlaylistManager 的切歌定时器自动续播歌单其余歌曲。
     // （直接 playURL 单曲推送不会注册切歌定时器，播完即停，见 issue #53）
     if (pm && appendedPlaylistId !== undefined) {
-      let playMode: PlayMode = 'order';
+      let playMode: PlayMode = 'loop';
       try {
         const devices = await this.configManager.getDevices(accountId);
         const devCfg = devices.find((d) => d.device_id === deviceId);
         if (devCfg && devCfg.play_mode) playMode = devCfg.play_mode as PlayMode;
       } catch (e) {
-        songloft.log.warn('[OnlineSearcher] Failed to read play mode, fallback to order: ' + String(e));
+        songloft.log.warn('[OnlineSearcher] Failed to read play mode, fallback to loop: ' + String(e));
       }
 
       const ok = await pm.playPlaylistFromSong(appendedPlaylistId, imported.id, playMode);
@@ -401,16 +428,35 @@ export class OnlineSearcher {
       songloft.log.warn(`[OnlineSearcher] Playlist takeover failed for playlist ${appendedPlaylistId}, falling back to single URL push`);
     }
 
-    // 没有目标歌单时，导入歌曲与已入库的独立歌曲共用临时歌手队列。
-    if (pm && indexingManager) {
-      indexingManager.addImportedSong({ id: imported.id, title: song.title, artist: song.artist, album: song.album });
-      let fullSong: any = { ...song, id: imported.id, url: imported.url, type: 'remote' };
-      try {
-        fullSong = await songloft.songs.getById(imported.id) || fullSong;
-      } catch (e) {
-        songloft.log.warn('[OnlineSearcher] Failed to read imported song detail: ' + String(e));
+    // 未配置目标歌单：同样交给 PlaylistManager，以「单曲临时列表 + order 模式」播放。
+    // 不能直接 playURL——那条路径不注册切歌定时器/结束探测，音箱自然播完后会重拉
+    // 同一 URL，表现为单曲无限循环（#437 同类问题）。order 模式单曲列表没有下一首，
+    // onSongFinished 会走 stop()，播完即停。
+    if (pm) {
+      const playable = await this.buildStandaloneSong(imported, song);
+      const ok = await pm.playWithSongs([playable], 0, 'order', `单曲: ${song.title}`, '');
+      if (ok) {
+        // 增量把这首独立远程歌曲加入内存索引，避免下一次点播再次走外部搜索。
+        if (indexingManager) {
+          indexingManager.addImportedSong(
+            { id: imported.id, title: song.title, artist: song.artist, album: song.album },
+            undefined,
+          );
+        }
+        songloft.log.info('[OnlineSearcher] Playing online song via standalone playlist (order, stop at end): ' + song.title + ' - ' + song.artist);
+        // 配置开启「播完自动连播」时，后台预取其他网络歌曲追加到临时队列。
+        // 不 await：预取失败/慢都不该影响这首种子歌的起播。
+        void this.startAutoContinue(pm, {
+          title: song.title,
+          artist: song.artist || '',
+          id: imported.id,
+          candidates: song.candidates,
+        }, indexingManager).catch((e) => {
+          songloft.log.warn('[OnlineSearcher] Failed to start auto-continue: ' + String(e));
+        });
+        return true;
       }
-      return pm.playStandaloneSong(fullSong, indexingManager);
+      songloft.log.warn('[OnlineSearcher] Standalone playlist takeover failed, falling back to direct URL push');
     }
 
     // 用返回的 url 构造完整播放 URL（相对路径，URLBuilder 会拼接 server_host 和 token）。
@@ -450,6 +496,243 @@ export class OnlineSearcher {
 
     songloft.log.info('[OnlineSearcher] Playing online song: ' + song.title + ' - ' + song.artist + ' url=' + playUrl);
     return true;
+  }
+
+  /**
+   * 构造供 PlaylistManager 播放的单曲对象。
+   * 优先从宿主读取完整歌曲（含 type/duration/封面等），失败时用导入响应和搜索结果兜底。
+   */
+  private async buildStandaloneSong(
+    imported: { id: number; url: string },
+    song: OnlineSearchResult,
+  ): Promise<any> {
+    try {
+      const full = await songloft.songs.getById(imported.id);
+      if (full) return full;
+    } catch (e) {
+      songloft.log.warn('[OnlineSearcher] Failed to load imported song, using fallback fields: ' + String(e));
+    }
+    return {
+      id: imported.id,
+      type: 'remote',
+      title: song.title,
+      artist: song.artist || '',
+      album: song.album || '',
+      duration: song.duration || 0,
+      file_path: '',
+      url: imported.url,
+      cover_path: '',
+      cover_url: song.cover_url || '',
+      lyric_url: '',
+      file_size: 0,
+      format: '',
+      bit_rate: 0,
+      sample_rate: 0,
+      is_live: false,
+      cache_hash: '',
+    };
+  }
+
+  /**
+   * 启动「单曲播完自动连播」链路。
+   *
+   * 仅当配置开启 external_search_auto_continue、外部搜索已启用且不是「不入库直接播放」时生效。
+   * 链路把后续网络歌曲追加到 PlaylistManager 当前的临时队列末尾：
+   * - 队列剩不到 2 首时提前补充，把搜索/导入耗时藏在正在播放的歌里；
+   * - 队列真播完时再等一次补充，仍没有新歌才停播；
+   * - 用户切歌单/重新点播后队列代数变化，旧链路自动失效，不会往新队列里塞歌。
+   *
+   * 歌源优先级：原搜索响应的 candidates → 按歌手派生的关键词再搜索 → 曲库里已导入的网络歌曲。
+   *
+   * 不阻塞调用方：本方法立即返回，预取在后台进行。
+   */
+  async startAutoContinue(
+    pm: PlaylistManager,
+    seed: { title: string; artist?: string; id?: number; candidates?: OnlineSearchResult[] },
+    indexingManager?: IndexingManager,
+  ): Promise<void> {
+    const config = await this.configManager.getConfig();
+    if (!config.external_search_enabled || !config.external_search_auto_continue) return;
+    if (config.external_search_no_import) {
+      songloft.log.info('[OnlineSearcher] 自动连播已开启，但「不入库直接播放」不支持续播，跳过');
+      return;
+    }
+    if (!(await this.isExternalSearchConfigured())) return;
+
+    const state: AutoContinueState = {
+      pm,
+      indexingManager,
+      generation: pm.getQueueGeneration(),
+      title: seed.title || '',
+      artist: seed.artist || '',
+      played: new Set([this.songKey(seed.title, seed.artist)]),
+      pending: (Array.isArray(seed.candidates) ? seed.candidates : [])
+        .filter((c) => !!c && !!c.title && !this.isSameSong(c, seed)),
+      queries: this.buildAutoContinueQueries(seed.title, seed.artist),
+      active: true,
+    };
+
+    const hook = async (): Promise<any[] | null> => {
+      if (!state.active) return null;
+      if (pm.getQueueGeneration() !== state.generation) {
+        state.active = false;
+        pm.setQueueRefillHook(undefined);
+        return null;
+      }
+
+      // 每次补充都重新读配置：用户中途关掉开关应立刻停止续播
+      const latest = await this.configManager.getConfig();
+      if (!latest.external_search_enabled || !latest.external_search_auto_continue || latest.external_search_no_import) {
+        state.active = false;
+        pm.setQueueRefillHook(undefined);
+        return null;
+      }
+
+      const songs = await this.fetchAutoContinueSongs(state);
+      if (songs.length === 0) {
+        state.active = false;
+        pm.setQueueRefillHook(undefined);
+        songloft.log.info('[OnlineSearcher] 自动连播没有更多可播放的网络歌曲，结束');
+        return null;
+      }
+      songloft.log.info(`[OnlineSearcher] 自动连播补充 ${songs.length} 首: ${songs.map((s) => s.title).join(' / ')}`);
+      return songs;
+    };
+
+    pm.setQueueRefillHook(hook);
+    songloft.log.info(`[OnlineSearcher] 自动连播已启用: seed="${seed.title} - ${seed.artist || ''}" 候选=${state.pending.length}`);
+
+    // 立即预取首批：种子歌曲一般还有几分钟，足够完成搜索和导入
+    void pm.replenishQueue(true).catch((e) => {
+      songloft.log.warn('[OnlineSearcher] 自动连播预取失败: ' + String(e));
+    });
+  }
+
+  /** 取一批后续网络歌曲（最多 AUTO_CONTINUE_BATCH 首），按歌源优先级依次尝试。 */
+  private async fetchAutoContinueSongs(state: AutoContinueState): Promise<any[]> {
+    const songs: any[] = [];
+    const queuedIds = new Set<number>();
+    for (const s of state.pm.getSongs()) {
+      if (s && s.id > 0) queuedIds.add(s.id);
+    }
+
+    const push = (song: any | null): void => {
+      if (!song || songs.length >= AUTO_CONTINUE_BATCH) return;
+      if (!(song.id > 0) || queuedIds.has(song.id)) return;
+      queuedIds.add(song.id);
+      state.played.add(this.songKey(song.title, song.artist));
+      songs.push(song);
+    };
+
+    // 1) 原搜索响应附带的同批候选（provider 支持时最省事，也最接近用户点的歌）
+    while (state.pending.length > 0 && songs.length < AUTO_CONTINUE_BATCH) {
+      const candidate = state.pending.shift()!;
+      push(await this.importAutoContinueCandidate(state, candidate, queuedIds));
+    }
+
+    // 2) 按歌手/歌名派生关键词再搜。每次最多试两条，避免一次补充耗时过长。
+    let attempts = 0;
+    while (state.queries.length > 0 && songs.length < AUTO_CONTINUE_BATCH && attempts < AUTO_CONTINUE_SEARCH_ATTEMPTS) {
+      const query = state.queries.shift()!;
+      attempts++;
+      const result = await this.search(query, null);
+      if (!result) continue;
+      const pool = [result, ...(Array.isArray(result.candidates) ? result.candidates : [])];
+      for (const candidate of pool) {
+        if (songs.length >= AUTO_CONTINUE_BATCH) break;
+        push(await this.importAutoContinueCandidate(state, candidate, queuedIds));
+      }
+    }
+
+    // 3) 外部搜索没给出新歌时，从曲库里已导入的网络歌曲兜底（不产生新的外部请求）
+    if (songs.length < AUTO_CONTINUE_BATCH) {
+      for (const song of await this.findLibraryRemoteSongs(state)) {
+        if (songs.length >= AUTO_CONTINUE_BATCH) break;
+        push(song);
+      }
+    }
+
+    return songs;
+  }
+
+  /**
+   * 导入一首自动连播候选并转成 PlaylistManager 可播放的完整歌曲对象。
+   * 已在本链路播过或已在队列里的歌直接跳过。
+   */
+  private async importAutoContinueCandidate(
+    state: AutoContinueState,
+    candidate: OnlineSearchResult,
+    queuedIds: Set<number>,
+  ): Promise<any | null> {
+    if (!candidate || !candidate.title) return null;
+    const key = this.songKey(candidate.title, candidate.artist);
+    if (state.played.has(key)) return null;
+
+    const imported = await this.importSong(candidate);
+    if (!imported) return null;
+    if (queuedIds.has(imported.id)) {
+      songloft.log.info(`[OnlineSearcher] 自动连播跳过队列已有歌曲: ${candidate.title}`);
+      return null;
+    }
+
+    const playable = await this.buildStandaloneSong(imported, candidate);
+    if (!playable) return null;
+
+    state.played.add(key);
+    if (state.indexingManager) {
+      state.indexingManager.addImportedSong(
+        { id: imported.id, title: candidate.title, artist: candidate.artist, album: candidate.album },
+        undefined,
+      );
+    }
+    songloft.log.info(`[OnlineSearcher] 自动连播加入: ${candidate.title} - ${candidate.artist || ''} id=${imported.id}`);
+    return playable;
+  }
+
+  /** 从曲库里找同歌手/同名的其他网络歌曲，作为外部搜索无新歌时的兜底。 */
+  private async findLibraryRemoteSongs(state: AutoContinueState): Promise<any[]> {
+    const queries = [state.artist, state.title].filter((q) => !!q);
+    const out: any[] = [];
+    for (const query of queries) {
+      try {
+        const result = await songloft.songs.search(query);
+        for (const song of result || []) {
+          if (out.length >= AUTO_CONTINUE_BATCH) break;
+          if (!song || song.type !== 'remote' || !song.url) continue;
+          if (state.played.has(this.songKey(song.title, song.artist))) continue;
+          out.push(song);
+        }
+      } catch (e) {
+        songloft.log.warn('[OnlineSearcher] 自动连播查询曲库失败: ' + String(e));
+      }
+      if (out.length >= AUTO_CONTINUE_BATCH) break;
+    }
+    return out;
+  }
+
+  /** 派生自动连播搜索词：优先同歌手，其次相似歌曲，最后用泛化热门词兜底。 */
+  private buildAutoContinueQueries(title: string, artist?: string): string[] {
+    const queries: string[] = [];
+    const a = (artist || '').trim();
+    const t = (title || '').trim();
+    if (a) {
+      queries.push(a, `${a} 热门`, `${a} 歌曲`, `${a} 经典`);
+    }
+    if (t) {
+      queries.push(`${t} 相似歌曲`);
+    }
+    queries.push('热门歌曲', '经典歌曲', '华语流行', '轻音乐');
+    return Array.from(new Set(queries.filter((q) => !!q)));
+  }
+
+  /** 归一化歌曲键：忽略空白、括号、连接符和大小写，用于链路内去重。 */
+  private songKey(title?: string, artist?: string): string {
+    const norm = (v: string): string => (v || '').toLowerCase().replace(/[\s\-_/\\()（）[\]【】·.,，。!！?？'"“”‘’]/g, '');
+    return `${norm(title || '')}|${norm(artist || '')}`;
+  }
+
+  private isSameSong(a: { title?: string; artist?: string }, b: { title?: string; artist?: string }): boolean {
+    return this.songKey(a.title, a.artist) === this.songKey(b.title, b.artist);
   }
 
   /**

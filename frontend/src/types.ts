@@ -16,6 +16,27 @@ export interface AIConfig {
   timeout?: number;
 }
 
+/** 问答接管配置（mi-song-gpt）：语义判定用 ai_config（小模型），问答用 qa_config（强模型+联网） */
+export interface QAConfig {
+  enabled?: boolean;
+  api_url?: string;
+  api_key?: string;
+  model?: string;
+  timeout?: number;
+  system_prompt?: string;
+  thinking_notice?: string;
+  native_answer_wait_sec?: number;
+  web_search_enabled?: boolean;
+  web_search_strategy?: 'auto' | 'hybrid';
+  web_search_fallback_notice?: string;
+  max_reply_length?: number;
+  followup_seconds?: number;
+  memory_enabled?: boolean;
+  context_turns?: number;
+  history_limit?: number;
+  history_days?: number;
+}
+
 export interface MiotConfig {
   server_host: string;
   server_host_status: 'empty' | 'loopback' | 'ok';
@@ -40,6 +61,7 @@ export interface MiotConfig {
   external_search_playlist_id: string;
   external_search_timeout: number;
   external_search_no_import: boolean;
+  external_search_auto_continue: boolean;
   search_priority: 'parallel' | 'local_first' | 'external_first';
   music_api_model_disabled: string[];
   music_api_model_defaults: string[];
@@ -56,6 +78,7 @@ export interface MiotConfig {
   default_cover_id: string | number;
   touchscreen_lyrics_enabled: boolean;
   ai_config: AIConfig;
+  qa_config: QAConfig;
 }
 
 export interface SearchSource {
@@ -187,6 +210,31 @@ export interface ConversationMessage {
   query?: string;
   text?: string;
   answer?: string;
+  /** 语音引擎处理来源：rule=口令 memory=记忆 search=搜索 ai=AI播放 xiaoai=小爱原生 llm=大模型接管 */
+  outcome?: string;
+  /** 来源补充说明（命中口令/AI 动作等） */
+  outcome_detail?: string;
+  /** 判定反馈与分阶段耗时（meta 行）：只有新产生的记录才有，历史记录缺省 */
+  outcome_meta?: OutcomeMeta;
+}
+
+/** 单个处理阶段的耗时 */
+export interface OutcomeStage {
+  key: string;
+  label: string;
+  ms: number;
+}
+
+/** 语音引擎的判定反馈与耗时明细 */
+export interface OutcomeMeta {
+  /** 语义判定结果（判定器启用时无论是否执行都会带上） */
+  ai?: { action: string; confidence: string; params?: unknown };
+  /** 分阶段耗时（按发生顺序） */
+  stages?: OutcomeStage[];
+  /** 处理总耗时 */
+  total_ms: number;
+  /** 是否真正执行了动作或完成接管 */
+  executed?: boolean;
 }
 
 export interface Webhook {

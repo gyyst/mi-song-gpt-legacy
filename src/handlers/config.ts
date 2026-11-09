@@ -77,6 +77,7 @@ export function registerConfigHandlers(
     try {
       const config = await configManager.getConfig();
       const aiConfig = await configManager.getAIConfig();
+      const qaConfig = await configManager.getQAConfig();
 
       let suggestedAddresses: string[] = [];
       try {
@@ -104,6 +105,7 @@ export function registerConfigHandlers(
           external_search_playlist_id: config.external_search_playlist_id ?? '',
           external_search_timeout: config.external_search_timeout ?? 6,
           external_search_no_import: !!config.external_search_no_import,
+          external_search_auto_continue: !!config.external_search_auto_continue,
           search_priority: normalizeSearchPriority(config.search_priority),
           music_api_model_disabled: config.music_api_model_disabled || [],
           music_api_model_defaults: [...DEFAULT_MUSIC_API_MODELS],
@@ -123,6 +125,7 @@ export function registerConfigHandlers(
           server_host_status: getServerHostStatus(config.server_host),
           suggested_addresses: suggestedAddresses,
           ai_config: aiConfig,
+          qa_config: qaConfig,
           default_cover_id: config.default_cover_id,
           touchscreen_lyrics_enabled: !!config.touchscreen_lyrics_enabled,
         },
@@ -255,6 +258,11 @@ export function registerConfigHandlers(
         config.external_search_no_import = !!body.external_search_no_import;
       }
 
+      // 更新 external_search_auto_continue（播完自动连播）
+      if (body.external_search_auto_continue !== undefined) {
+        config.external_search_auto_continue = !!body.external_search_auto_continue;
+      }
+
       // 更新 search_priority
       if (body.search_priority !== undefined) {
         config.search_priority = normalizeSearchPriority(body.search_priority);
@@ -376,6 +384,64 @@ export function registerConfigHandlers(
           aiConfig.timeout = newAI.timeout;
         }
         await configManager.saveAIConfig(aiConfig);
+      }
+
+      // 更新 qa_config（问答接管，mi-song-gpt）
+      if (body.qa_config !== undefined) {
+        const qaConfig = await configManager.getQAConfig();
+        const newQA = body.qa_config as Record<string, unknown>;
+        if (typeof newQA.enabled === 'boolean') {
+          qaConfig.enabled = newQA.enabled;
+        }
+        if (typeof newQA.api_url === 'string') {
+          qaConfig.api_url = newQA.api_url;
+        }
+        if (typeof newQA.api_key === 'string') {
+          qaConfig.api_key = newQA.api_key;
+        }
+        if (typeof newQA.model === 'string') {
+          qaConfig.model = newQA.model;
+        }
+        if (typeof newQA.timeout === 'number') {
+          qaConfig.timeout = Math.max(1, Math.min(30, newQA.timeout));
+        }
+        if (typeof newQA.system_prompt === 'string') {
+          qaConfig.system_prompt = newQA.system_prompt;
+        }
+        if (typeof newQA.thinking_notice === 'string') {
+          qaConfig.thinking_notice = newQA.thinking_notice;
+        }
+        if (typeof newQA.native_answer_wait_sec === 'number') {
+          qaConfig.native_answer_wait_sec = Math.max(0, Math.min(10, newQA.native_answer_wait_sec));
+        }
+        if (typeof newQA.web_search_enabled === 'boolean') {
+          qaConfig.web_search_enabled = newQA.web_search_enabled;
+        }
+        if (newQA.web_search_strategy === 'auto' || newQA.web_search_strategy === 'hybrid') {
+          qaConfig.web_search_strategy = newQA.web_search_strategy;
+        }
+        if (typeof newQA.web_search_fallback_notice === 'string') {
+          qaConfig.web_search_fallback_notice = newQA.web_search_fallback_notice;
+        }
+        if (typeof newQA.max_reply_length === 'number') {
+          qaConfig.max_reply_length = Math.max(0, Math.min(500, Math.round(newQA.max_reply_length)));
+        }
+        if (typeof newQA.followup_seconds === 'number') {
+          qaConfig.followup_seconds = Math.max(0, Math.min(300, Math.round(newQA.followup_seconds)));
+        }
+        if (typeof newQA.memory_enabled === 'boolean') {
+          qaConfig.memory_enabled = newQA.memory_enabled;
+        }
+        if (typeof newQA.context_turns === 'number') {
+          qaConfig.context_turns = Math.max(1, Math.min(24, Math.round(newQA.context_turns)));
+        }
+        if (typeof newQA.history_limit === 'number') {
+          qaConfig.history_limit = Math.max(12, Math.min(500, Math.round(newQA.history_limit)));
+        }
+        if (typeof newQA.history_days === 'number') {
+          qaConfig.history_days = Math.max(1, Math.min(30, Math.round(newQA.history_days)));
+        }
+        await configManager.saveQAConfig(qaConfig);
       }
 
       // 更新 scheduled_tasks_enabled（联动 Scheduler 启停）

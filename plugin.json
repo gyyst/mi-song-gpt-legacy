@@ -1,14 +1,12 @@
 {
   "$schema": "https://raw.githubusercontent.com/songloft-org/plugin-toolchain/main/schemas/plugin.schema.json",
-  "name": "智能音箱",
-  "version": "2026.11.9.1",
-  "description": "通过 MIoT 协议把歌曲投放到智能音箱设备",
-  "author": "Songloft Team",
-  "homepage": "https://github.com/songloft-org/songloft-plugin-miot",
+  "name": "mi-song-gpt",
+  "version": "2026.11.9.2",
+  "description": "基于 songloft-plugin-miot 的定制版（独立维护分支）。执行流程：固定口令 → 语音记忆 → 搜索口令 → AI 语义判定 → 问答接管。新增问答接管（小爱答不上来时由大模型接管，可联网搜索/带上下文/分段播报）、AI 播放意图语义判定、对话记录来源徽标与分阶段耗时、语音记忆重播；播放类指令优先本地曲库，其次外部搜索推流；本分支修复外部搜索单曲播完后重复播放的问题，并支持播完自动连播",
   "license": "Apache-2.0",
   "icon": "frontend/public/icon.svg",
-  "entryPath": "miot",
-  "main": "main.js",
+  "entryPath": "mi-song-gpt",
+  "main": "main.jsc",
   "minHostVersion": "2.9.5",
   "renderEngine": "webview",
   "permissions": [
@@ -25,9 +23,8 @@
   "publicPaths": [
     "/dlna"
   ],
-  "updateUrl": "https://raw.githubusercontent.com/songloft-org/songloft-plugin-miot/main/plugin.json",
-  "download_url": "https://github.com/songloft-org/songloft-plugin-miot/releases/download/v2026.11.9.1/miot.jsplugin.zip",
-  "entryHash": "bc087468860f36e9217f981a116c1d24e79138769944f0237600317c3a2ee4f1",
-  "zipHash": "4ececfdc73a76ec110a7cfd1043a312e1bdb3e44366a5f0e0ad0f85a51052d79",
-  "releaseSource": "5947732db70ec8caabf8ba70cdb115e8685d247b"
+  "updateUrl": "https://raw.githubusercontent.com/gyyst/mi-song-gpt/main/plugin.json",
+  "download_url": "https://github.com/gyyst/mi-song-gpt/releases/download/v2026.11.9.2/mi-song-gpt.jsplugin.zip",
+  "entryHash": "f78bdb167913118c2bb61d887d2128289639846ab83e5489e476f6b1aba66c43",
+  "zipHash": "1f10336e3904e6c3f4c6b1e444c98f2117908101d86bc20198f8333316ff65ba"
 }

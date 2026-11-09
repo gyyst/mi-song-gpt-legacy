@@ -1,4 +1,3 @@
-import type { ChatStatus } from '../../src/chat/types';
 import { computed, reactive } from 'vue';
 import { del, get, messageOf, pluginWebSocketUrl, post, query } from './api';
 import type {
@@ -47,6 +46,7 @@ const defaultConfig: MiotConfig = {
   external_search_playlist_id: '',
   external_search_timeout: 6,
   external_search_no_import: false,
+  external_search_auto_continue: false,
   search_priority: 'parallel',
   music_api_model_disabled: [],
   music_api_model_defaults: [],
@@ -63,6 +63,7 @@ const defaultConfig: MiotConfig = {
   default_cover_id: '',
   touchscreen_lyrics_enabled: false,
   ai_config: {},
+  qa_config: {},
 };
 
 export interface SnackbarState {
@@ -94,7 +95,6 @@ export interface ConfirmState {
 }
 
 export const state = reactive({
-  chatStatus: null as ChatStatus | null,
   initialized: false,
   loading: true,
   startupError: '',
@@ -287,6 +287,7 @@ export async function loadConfig(): Promise<void> {
     music_api_model_disabled: Array.isArray(config?.music_api_model_disabled) ? config.music_api_model_disabled : [],
     music_api_model_defaults: Array.isArray(config?.music_api_model_defaults) ? config.music_api_model_defaults : [],
     ai_config: config?.ai_config && typeof config.ai_config === 'object' ? { ...config.ai_config } : {},
+    qa_config: config?.qa_config && typeof config.qa_config === 'object' ? { ...config.qa_config } : {},
   };
   Object.assign(state.config, normalized);
   state.configLoaded = true;
@@ -524,7 +525,7 @@ export async function playSong(song: Song, visibleIndex?: number): Promise<void>
       playlist_id: Number(state.selectedPlaylistId),
       song_id: song.id,
       start_index: fallbackIndex >= 0 ? fallbackIndex : visibleIndex || 0,
-      play_mode: state.player.play_mode || 'order',
+      play_mode: state.player.play_mode || 'loop',
     });
     void refreshPlaylistProgress();
   });
@@ -542,7 +543,7 @@ export async function resumePlaylist(): Promise<void> {
       ...targetBody(),
       playlist_id: Number(state.selectedPlaylistId),
       start_position: 'resume',
-      play_mode: state.player.play_mode || 'order',
+      play_mode: state.player.play_mode || 'loop',
     });
     void refreshPlaylistProgress();
   });
@@ -863,9 +864,29 @@ export async function saveVoiceCommands(commands = state.voiceCommands): Promise
   notify('语音口令已保存', 'success');
 }
 
+/**
+ * 最近对话记录统一按时间降序。WS 增量帧的到达顺序不可靠（同批多条时 unshift 会把
+ * 顺序翻转），所有入口（快照/增量/轮询刷新）赋值前都过这里，顺序永远与到达无关（mi-song-gpt）。
+ */
+export function sortConversationDesc(list: ConversationMessage[]): ConversationMessage[] {
+  return [...list].sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+}
+
+/**
+ * 按 id upsert：outcome 补推帧替换原条目（不产生重复），真正的新消息插到顶部，
+ * 最后统一降序（mi-song-gpt）。
+ */
+export function upsertConversationMessage(list: ConversationMessage[], item: ConversationMessage): ConversationMessage[] {
+  const idx = item.id ? list.findIndex(m => m.id === item.id) : -1;
+  if (idx >= 0) list.splice(idx, 1, item);
+  else list.unshift(item);
+  return sortConversationDesc(list);
+}
+
 export async function loadConversationMessages(): Promise<void> {
-  state.conversationMessages =
-    (await get<ConversationMessage[]>('/conversation/messages?limit=50')) || [];
+  state.conversationMessages = sortConversationDesc(
+    (await get<ConversationMessage[]>('/conversation/messages?limit=50')) || [],
+  );
 }
 
 export async function addWebhook(name: string, url: string): Promise<void> {

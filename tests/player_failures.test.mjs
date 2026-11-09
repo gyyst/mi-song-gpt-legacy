@@ -62,6 +62,10 @@ const { MusicCommandService: VoiceEngine } = loadSource('../src/music/service.ts
   '../playback/sleep_timer': loadSource('../src/playback/sleep_timer.ts', { '../sleep_timer': sleepTimer }),
   '../player/manager': players,
   '../voicecmd/ai_analyzer': {},
+  '../voicecmd/qa_fallback': { QAFallback: class { } },
+  '../chat/memory': { ChatMemoryService: class { } },
+  '../ai/client': { AIClient: class { } },
+  '../ws/conversation-stream': { notifyConversationOutcome: () => { } },
   '../voicecmd/online_searcher': { OnlineSearcher: class { } },
   '../handlers/playlist': {},
   '../utils/http': http,
@@ -751,6 +755,8 @@ function resumeEngine(manager) {
   };
   engine.accountManager = { getAccounts: async () => [{ id: 'account' }] };
   engine.memoryService = { setMaxRecords: async () => { } };
+  // Object.create 跳过构造器，补上 QA 兜底依赖（未接管 → 走原有流程）
+  engine.qaFallback = { handle: async () => ({ handled: false, outcome: 'none' }), testQA: async () => null };
   engine.playlistManagerMap = { get: () => manager, cancelHourlyResumes: device => manager.cancelHourlyResume(device) };
   engine.minaService = manager.minaService;
   return engine;
@@ -763,136 +769,6 @@ function timerMessage(question, content = '') {
   };
 }
 
-for (const api of ['music', 'url']) {
-  for (const statusPage of [false, true]) {
-    for (const speed of [0.5, 1, 2]) {
-      for (const idleStatus of [0, 3]) {
-        test(`issue 533 integrated: monitor to dispatcher to ${api}, statusPage=${statusPage}, speed=${speed}, idle=${idleStatus}`, async () => {
-          await withClock(async h => {
-            const chatTypes = loadSource('../src/chat/types.ts', { '../utils/ai_headers': loadSource('../src/utils/ai_headers.ts', {}) });
-            const { VoiceDispatcher } = loadSource('../src/voicecmd/dispatcher.ts', { '../chat/types': chatTypes, '../conversation/query': conversation });
-            const { PlaybackCoordinator } = loadSource('../src/playback/coordinator.ts', { '../chat/types': chatTypes });
-            const { ConversationMonitor } = loadSource('../src/conversation/monitor.ts', { '../utils/debug': { isDebugLog: () => false } });
-            const config = {
-              getConfig: async () => ({ conversation_poll_interval: 2, smart_resume_timeout: 30, music_api_model_disabled: api === 'url' ? ['L15A'] : [] }),
-              getChatConfig: async () => chatTypes.DEFAULT_CHAT_CONFIG,
-              getWebhooks: async () => [],
-              findDeviceGroup: async () => null,
-            };
-            const client = new MinaHTTPClient({ user_id: 'test', device_id: 'test', services: {} });
-            const accounts = {
-              getMinaClient: () => client,
-              getAccounts: async () => [{ id: 'account' }],
-              getManagedDevices: async () => [{ device_id: 'speaker', device_name: 'fixture', hardware: 'L15A' }],
-            };
-            const service = new MinaService(accounts, config);
-            service.getDeviceIdentity = async () => ({ hardware: 'L15A' });
-            const pushed = [], spoken = [], queries = [];
-            let wakeAt = Infinity;
-            let streamAt = Date.now() - 20000;
-            let seek = 60;
-            let interrupted = false;
-            client.getLatestAskFromXiaoai = async () => {
-              const available = Date.now() >= wakeAt + 4500;
-              await new Promise(resolve => setTimeout(resolve, 500));
-              return available ? [{ ...timerMessage('半小时后停止播放', '好的，30分钟后我会停止播放').message, timestamp_ms: wakeAt, request_id: 'sleep-533' }] : [];
-            };
-            client.doUbusRequest = async (_device, method, _path, message) => {
-              if (method === 'player_get_play_status') {
-                queries.push(Date.now());
-                const speaking = interrupted && Date.now() < wakeAt + 8000;
-                const info = interrupted
-                  ? { status: speaking ? 1 : idleStatus }
-                  : { status: 1, play_song_detail: { position: Math.min(Date.now() - streamAt, (300 - seek) / speed * 1000), duration: (300 - seek) / speed * 1000 } };
-                await new Promise(resolve => setTimeout(resolve, 500));
-                return { code: 0, data: { info: JSON.stringify(info) } };
-              }
-              await new Promise(resolve => setTimeout(resolve, 500));
-              if (method === 'player_play_music' || method === 'player_play_url') {
-                assert.equal(method, api === 'music' ? 'player_play_music' : 'player_play_url');
-                const url = method === 'player_play_music' ? JSON.parse(message.music).payload.audio_items[0].stream.url : message.url;
-                pushed.push({ url, at: Date.now() });
-                seek = Number(new URL(url).searchParams.get('seek') || 0);
-                streamAt = Date.now();
-                interrupted = false;
-              }
-              if (method === 'text_to_speech' || method === 'player_play_tts') spoken.push(message.text);
-              return { code: 0, data: { code: 0 } };
-            };
-            const { manager } = player({ mode: 'order' });
-            manager.minaService = service;
-            manager.streamSeekOffsetSec = seek;
-            manager.playbackSpeed = speed;
-            manager.playStartTimeMs = streamAt - seek / speed * 1000;
-            manager.streamStartedAtMs = streamAt;
-            manager.playbackConfirmed = true;
-            manager.resetAutoNextTimer(manager.getPosition(), false);
-            const engine = resumeEngine(manager);
-            engine.configManager.getConfig = config.getConfig;
-            engine.configManager.getChatConfig = config.getChatConfig;
-            const players = engine.playlistManagerMap;
-            const playback = new PlaybackCoordinator(players, service, config);
-            const dispatcher = new VoiceDispatcher(config, engine, {
-              status: () => ({ phase: 'completed', followup_until: 0 }),
-              cancel: async () => { },
-            }, playback);
-            const monitor = new ConversationMonitor(accounts, config);
-            monitor.registerCallback('voice', message => dispatcher.submit(message));
-            const starting = monitor.start();
-            await flush();
-            await h.advance(1000);
-            await starting;
-            let polling = statusPage;
-            let statusTimer;
-            const poll = async () => {
-              await resolvePlayerStatus({ getOrCreate: async () => manager }, service, 'account', 'speaker');
-              if (polling) statusTimer = setTimeout(poll, 1000);
-            };
-            updateDeviceStatusCache('account', 'speaker', { timestamp: 0 });
-            if (polling) void poll();
-            // Prime both monitor idle backoff and the real device-status cache before waking the speaker.
-            await h.advance(10000);
-            wakeAt = Date.now();
-            interrupted = true;
-            await h.advance(7999);
-            assert.equal(pushed.length, 0, 'do not interrupt the native answer');
-            await h.advance(16001);
-            assert.equal(monitor.getMessages().length, 1, 'the real monitor must deliver and deduplicate the cloud record');
-            assert.equal(pushed.length, 1, 'the full guarded dispatch/cache chain must actually send recovery audio');
-            assert.match(pushed[0].url, /\/songs\/16\/play/);
-            assert.ok(Number(new URL(pushed[0].url).searchParams.get('seek')) >= 60 + 31 * speed, 'preserve the pre-wakeup position');
-            assert.equal(manager.getPlaybackSpeed(), speed);
-            assert.equal(manager.isVoiceSuspended(), false);
-            assert.deepEqual(spoken, [], 'the real client must receive no duplicate native confirmation');
-            assert.equal(engine.getSleepTimerState('account', 'speaker').total, 1800000);
-            monitor.stop();
-            for (let index = 0; index < 2; index++) {
-              const endAt = streamAt + (300 - seek) / speed * 1000;
-              await h.advance(endAt - Date.now() - 1);
-              assert.equal(manager.currentIndex, index, 'preserve each track through its actual end');
-              await h.advance(7001);
-              assert.equal(manager.currentIndex, index + 1);
-              assert.equal(pushed.length, index + 2);
-              assert.ok(pushed.at(-1).url.includes(`/songs/${songs[index + 1].id}/play`));
-            }
-            assert.equal(manager.unplayableSongs.size, 0);
-            assert.ok(manager.checkTimer !== null);
-            assert.ok(queries.length > 0);
-            assert.deepEqual(spoken, []);
-            assert.ok(!h.logs.some(line => /Smart resume failed|VoiceDispatcher.*failed=|External stop confirmed/.test(line)));
-            polling = false;
-            clearTimeout(statusTimer);
-            dispatcher.close();
-            engine.close();
-            playback.close();
-            manager.cleanup();
-            assert.equal(h.timers.size, 0);
-          });
-        });
-      }
-    }
-  }
-}
 
 for (const withStatusPage of [false, true]) {
   for (const [seek, speed] of [[0, 1], [100, 0.5], [60, 2]]) {
@@ -2080,7 +1956,7 @@ for (const waitMs of [3600000, 12 * 3600000]) {
       assert.equal(manager.getCurrentSong().id, 17);
       assert.equal(pushed.length, 2);
       assert.ok(pushed[1].includes('/songs/17/play'));
-      assert.ok(h.hostCalls.some(([method, path]) => method === 'POST' && path === '/api/v1/songs/16/played?source=miot'));
+      assert.ok(h.hostCalls.some(([method, path]) => method === 'POST' && path === '/api/v1/songs/16/played?source=mi-song-gpt'));
       manager.cleanup();
     });
   });
@@ -3351,7 +3227,7 @@ function hourlyConfig() {
   const routes = new Map();
   let config = {};
   let cancellations = 0;
-  const manager = { getConfig: async () => ({ ...config }), getAIConfig: async () => ({}), saveConfig: async value => { config = value; } };
+  const manager = { getConfig: async () => ({ ...config }), getAIConfig: async () => ({}), getQAConfig: async () => ({}), saveConfig: async value => { config = value; } };
   registerConfigHandlers({ get: (path, fn) => routes.set('GET ' + path, fn), post: (path, fn) => routes.set('POST ' + path, fn) },
     manager, {}, {}, { cancelHourlyResumes: () => cancellations++ }, {});
   return {
@@ -3551,21 +3427,48 @@ test('active chat detects volume controls without enabling the music engine', as
   });
 });
 
-test('DLNA takeover invalidates pending voice analysis before it can replace the cast', async () => {
+test('external control takeover invalidates pending voice analysis before it can replace the cast', async () => {
   await withClock(async () => {
-    const chatTypes = loadSource('../src/chat/types.ts', { '../utils/ai_headers': loadSource('../src/utils/ai_headers.ts', {}) });
-    const { VoiceDispatcher } = loadSource('../src/voicecmd/dispatcher.ts', { '../chat/types': chatTypes, '../conversation/query': conversation });
-    const { PlaybackCoordinator } = loadSource('../src/playback/coordinator.ts', { '../chat/types': chatTypes });
+    const { VoiceDispatcher } = loadSource('../src/voicecmd/dispatcher.ts', {});
     const { manager } = player(), wait = deferred(), calls = [];
-    manager.minaService.setOnControl = callback => { manager.minaService.notifyControl = callback; };
-    const config = { getChatConfig: async () => chatTypes.DEFAULT_CHAT_CONFIG, findDeviceGroup: async () => null };
-    const playback = new PlaybackCoordinator({ get: () => manager }, manager.minaService, config);
-    const music = { cancelPendingResume() { }, hasFixedControl: async () => false, handleMessage: async (_message, options) => { await wait.promise; if (options.current()) calls.push('stale music'); return true; } };
-    const chat = { status: () => ({ phase: 'completed', followup_until: 0 }), interruptForRouting: async () => undefined };
-    const dispatcher = new VoiceDispatcher(config, music, chat, playback);
+    const music = { cancelPendingResume() { }, fixedControlType: async () => undefined, hasFixedControl: async () => false, handleMessage: async (_message, options) => { await wait.promise; if (options.current()) calls.push('stale music'); return true; } };
+    const dispatcher = new VoiceDispatcher(music, { get: () => manager });
     dispatcher.submit({ account_id: 'account', device_id: 'speaker', message: { request_id: 'old', response: { answer: [{ question: '播放歌曲' }] } } });
-    await flush(); await manager.beginExternalPlayback(() => { }); wait.resolve(); await flush();
-    assert.deepEqual(calls, []); assert.equal(manager.isExternalPlayback(), true); dispatcher.close(); manager.cleanup();
+    await flush(); dispatcher.invalidateDevice('account', 'speaker'); wait.resolve(); await flush();
+    assert.deepEqual(calls, []); dispatcher.close(); manager.cleanup();
+  });
+});
+
+test('external resume poll ignores playing state without progress', async () => {
+  await withClock(async () => {
+    const tts = player({ service: { getPlayState: async () => ({ status: 1, position: 0, duration: 0, hasPosition: false }) } });
+    await tts.manager.stop();
+    for (let i = 0; i < 4; i++) await tts.manager.checkExternalResume();
+    assert.equal(tts.manager.state, 'stopped', 'TTS/progress-less playback must not trigger external resume takeover');
+
+    const stream = player({ service: { getPlayState: async () => ({ status: 1, position: 0, duration: 300, hasPosition: false }) } });
+    await stream.manager.stop();
+    await stream.manager.checkExternalResume();
+    assert.equal(stream.manager.state, 'stopped', 'single hit is not enough to take over');
+    await stream.manager.checkExternalResume();
+    assert.equal(stream.manager.state, 'playing', 'our own stream resuming must be taken over');
+    stream.manager.cleanup();
+  });
+});
+
+test('suppressing external resume detection blocks adoption until release', async () => {
+  await withClock(async () => {
+    const { manager } = player({ service: { getPlayState: async () => ({ status: 1, position: 45, duration: 300, hasPosition: true }) } });
+    await manager.stop();
+    manager.suppressExternalResume();
+    assert.equal(manager.resumePollTimer, null, 'poll timer must be cleared while suppressed');
+    for (let i = 0; i < 3; i++) await manager.checkExternalResume();
+    assert.equal(manager.state, 'stopped', 'no adoption while suppressed');
+    manager.releaseExternalResume();
+    await manager.checkExternalResume();
+    await manager.checkExternalResume();
+    assert.equal(manager.state, 'playing', 'genuine playback resume must be adopted after release');
+    manager.cleanup();
   });
 });
 
@@ -3731,60 +3634,6 @@ for (const kind of ['voice', 'hourly']) {
       s.engine?.setEnabled(false);
       s.manager.cleanup();
       assert.equal(h.timers.size, 0);
-    });
-  });
-}
-
-for (const mode of ['order', 'random', 'loop', 'single', 'singlePlay']) {
-  test(`standalone artist queue: matched song starts first and ${mode} controls natural completion`, async () => {
-    await withClock(async (h) => {
-      const tracks = songs.map((song) => ({ ...song, artist: '周杰伦', album: '', type: 'remote' }));
-      const { manager, pushes, tts } = player({
-        service: {
-          getPlayState: async () => ({
-            status: 1,
-            position: 0,
-            duration: 0,
-            hasPosition: false,
-            sampledAt: Date.now(),
-          }),
-        },
-      });
-      const saved = {};
-      manager.configManager.getDevices = async () => [{ device_id: 'speaker', play_mode: mode }];
-      manager.configManager.updateDevice = async (_account, _device, patch) => Object.assign(saved, patch);
-      const indexingManager = {
-        loadLibrarySongsByArtist: async (artist) => {
-          assert.equal(artist, '周杰伦');
-          return [tracks[0], tracks[1], tracks[2], tracks[1]];
-        },
-      };
-      assert.equal(await VoiceEngine.prototype.playStandaloneSong.call({ indexingManager }, tracks[1], manager), true);
-      assert.deepEqual(
-        manager.getSongs().map((song) => song.id),
-        [17, 16, 18],
-      );
-      assert.equal(manager.getStatus().playlist_name, '歌手: 周杰伦');
-      assert.equal(manager.getStatus().current_song.id, 17);
-      assert.equal(manager.getStatus().play_mode, mode);
-      assert.ok(pushes[0].includes('/songs/17/play'));
-      assert.equal(saved.temp_artist, '周杰伦');
-      assert.equal(saved.temp_artist_exact, true);
-      assert.equal(saved.temp_song_id, 17);
-      await h.advance(299999);
-      assert.equal(pushes.length, 1, 'must not cut the requested song short');
-      await h.advance(1);
-      if (mode === 'singlePlay') {
-        assert.equal(pushes.length, 1);
-        assert.equal(manager.state, 'paused');
-      } else {
-        assert.equal(pushes.length, 2);
-        assert.ok(pushes[1].includes(`/songs/${mode === 'single' ? 17 : 16}/play`));
-        assert.ok(manager.checkTimer !== null);
-      }
-      assert.equal(manager.unplayableSongs.size, 0);
-      assert.deepEqual(tts, []);
-      manager.cleanup();
     });
   });
 }

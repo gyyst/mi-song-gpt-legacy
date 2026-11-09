@@ -1,209 +1,102 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { flush } from './chat_loader.mjs';
-import { load, configOf, turnOf, chatOf, storageOf, validateChatConfig, chatConnection, chatScope, ChatMemoryService } from './chat_fixture.mjs';
+import { loadSdk } from './chat_loader.mjs';
+import { load, qaConfigOf, turnOf, storageOf, ChatMemoryService } from './chat_fixture.mjs';
 const { registerChatHandlers, chatBody } = load('../src/handlers/chat.ts');
-const { handleChatWebSocket } = load('../src/ws/chat-stream.ts');
-const { createRouter } = load('../../../toolchain/packages/plugin-sdk/src/index.ts');
-const target = { account_id: 'a', device_id: 'd' }, scope = chatScope('a', 'd');
+const { createRouter } = loadSdk();
+
 function routesOf(t, options = {}) {
-  const h = chatOf(t, options), router = createRouter();
-  h.config.getAccounts = async () => [{ id: 'a' }, { id: 'b' }];
-  h.config.getDevices = async () => [{ device_id: 'd', managed: true }, { device_id: 'e', managed: false }];
-  h.config.saveChatConfig = async (updates) => { const value = validateChatConfig(updates, await h.config.getChatConfig()); h.setConfig(value); return value; };
-  registerChatHandlers(router, h.config, h.chat);
-  const request = async (method, path, body, query = new URLSearchParams(target).toString()) => {
-    const response = await router.handle({ method, path, query, body: body === undefined ? undefined : typeof body === 'string' || body instanceof Uint8Array ? body : JSON.stringify(body) });
+  const { values } = storageOf(t);
+  const memory = new ChatMemoryService();
+  const config = {
+    getAccounts: async () => [{ id: 'a' }, { id: 'b' }],
+    getQAConfig: async () => qaConfigOf(options.qaConfig),
+  };
+  const router = createRouter();
+  registerChatHandlers(router, config, memory);
+  const request = async (method, path, body, search = 'account_id=a') => {
+    const response = await router.handle({ method, path, query: search, body: body === undefined ? undefined : typeof body === 'string' || body instanceof Uint8Array ? body : JSON.stringify(body) });
     return { code: response.statusCode, body: JSON.parse(response.body) };
   };
-  return { ...h, request };
+  return { values, memory, request };
 }
-for (const [field, min, max] of [['timeout', 1, 30], ['followup_seconds', 0, 300], ['context_turns', 0, 24], ['history_limit', 12, 500], ['history_days', 1, 30]]) {
-  test(`config ${field}: accepts bounds and rejects wrong types/fraction/out-of-range`, () => {
-    for (const value of [min, max])
-      assert.equal(validateChatConfig({ [field]: value })[field], value);
-    for (const value of [min - 1, max + 1, '2', null, 1.5, Infinity, NaN])
-      assert.throws(() => validateChatConfig({ [field]: value }));
-  });
-}
-for (const field of ['enabled', 'fallback_enabled', 'resume_music', 'memory_enabled']) {
-  test(`config ${field}: only accepts booleans`, () => {
-    for (const value of [false, true])
-      assert.equal(validateChatConfig({ [field]: value })[field], value);
-    for (const value of [0, 1, 'false', null])
-      assert.throws(() => validateChatConfig({ [field]: value }));
-  });
-}
-test('config validates all string/trigger fields and never mutates default arrays', () => {
-  for (const field of ['api_url', 'api_key', 'model', 'system_prompt']) {
-    for (const value of [123, [], null, 'x'.repeat(field === 'system_prompt' ? 4001 : 2001)])
-      assert.throws(() => validateChatConfig({ [field]: value }));
-  }
-  for (const triggers of [[], [' '], ['x'.repeat(31)], Array(21).fill('x'), [1], '问'])
-    assert.throws(() => validateChatConfig({ trigger_words: triggers }));
-  for (const value of [null, [], 'config'])
-    assert.throws(() => validateChatConfig(value));
-  assert.deepEqual(validateChatConfig({ trigger_words: [' 问 ', '问'] }).trigger_words, ['问']);
-  const base = configOf({ trigger_words: ['问'] }), next = validateChatConfig({ model: ' new ' }, base);
-  next.trigger_words.push('别的');
-  assert.deepEqual(base.trigger_words, ['问']);
-  assert.equal(next.model, 'new');
-  assert.equal(chatConnection(configOf(), { model: 'wrong' }).model, 'model');
+
+test('chatBody parses JSON string and Uint8Array bodies, rejects invalid input', () => {
+  assert.deepEqual(chatBody({ body: '{"a":1}' }), { a: 1 });
+  const bytes = new TextEncoder().encode('{"b":2}');
+  assert.deepEqual(chatBody({ body: bytes }), { b: 2 });
+  assert.throws(() => chatBody({ body: '{broken' }), /无效/);
+  assert.throws(() => chatBody({ body: '[1]' }), /对象/);
 });
-for (const raw of ['null', '[]', '1', '"string"', '{bad', new Uint8Array([255])]) {
-  test(`request body rejects invalid JSON objects: ${String(raw)}`, () => assert.throws(() => chatBody({ body: raw })));
-}
-test('request body decodes UTF-8 text and accepts missing body', () => {
-  assert.deepEqual(chatBody({ body: new TextEncoder().encode('{"text":"请问天气😀"}') }), { text: '请问天气😀' });
-  assert.deepEqual(chatBody({}), {});
+
+test('history requires a known account', async (t) => {
+  const { request } = routesOf(t);
+  assert.equal((await request('GET', '/chat/history', undefined, '')).code, 400);
+  const unknown = await request('GET', '/chat/history', undefined, 'account_id=ghost');
+  assert.equal(unknown.code, 400);
+  assert.equal((await request('GET', '/chat/history')).code, 200);
 });
-for (const body of [{}, { account_id: 1, device_id: 'd' }, { account_id: 'missing', device_id: 'd' }, { account_id: 'a', device_id: 'missing' }, { account_id: 'a', device_id: 'e' }]) {
-  test(`HTTP rejects missing/unmanaged target ${JSON.stringify(body)}`, async (t) => {
-    const h = routesOf(t), response = await h.request('POST', '/chat/messages', { ...body, text: '问题', speak: false });
-    assert.equal(response.code, 400);
-    assert.equal(response.body.error, 'chat_request_failed');
-    assert.equal(h.chat.busyReason(), '');
-  });
-}
-for (const [path, body] of [
-  ['/chat/messages', { text: '', speak: false }], ['/chat/messages', { text: 'x'.repeat(2001) }], ['/chat/messages', { text: 1 }], ['/chat/messages', { text: '问', speak: 'false' }],
-  ['/chat/cancel', { close_session: 0 }], ['/chat/cancel', { resume_music: 'true' }], ['/chat/clear', { range: 'bad' }], ['/chat/memories', { content: 42 }], ['/chat/memories', { content: ' ' }], ['/chat/memories', { content: 'x'.repeat(301) }],
-]) {
-  test(`HTTP validates ${path} ${Object.keys(body).join(',')}`, async (t) => {
-    const h = routesOf(t), response = await h.request('POST', path, { ...target, ...body });
-    assert.equal(response.code, 400);
-    assert.equal(typeof response.body.detail, 'string');
-  });
-}
-test('HTTP chat defaults, partial config save, disabled chat and byte-array submit', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const h = routesOf(t, { config: { enabled: false } });
-  assert.equal((await h.request('GET', '/chat/config')).body.enabled, false);
-  assert.equal((await h.request('POST', '/chat/messages', { ...target, text: '问', speak: false })).code, 400);
-  const saved = await h.request('PUT', '/chat/config', { enabled: true, followup_seconds: 0 });
-  assert.equal(saved.code, 200);
-  assert.equal(saved.body.model, 'model');
-  const submitted = await h.request('POST', '/chat/messages', new TextEncoder().encode(JSON.stringify({ ...target, text: '问题', speak: false })));
-  assert.equal(submitted.code, 202);
-  assert.equal(submitted.body.phase, 'queued');
-  t.mock.timers.tick(0);
-  await flush();
-  const status = await h.request('GET', '/chat/status');
-  assert.equal(status.body.task_id, submitted.body.task_id);
-  assert.equal(status.body.phase, 'completed');
-  assert.ok(!h.calls.some(c => Array.isArray(c) && ['pause', 'speak', 'resume'].includes(c[0])));
+
+test('memory CRUD is account-scoped and validates content', async (t) => {
+  const { request } = routesOf(t);
+  const bad = await request('POST', '/chat/memories', { content: '' });
+  assert.equal(bad.code, 400);
+  const created = await request('POST', '/chat/memories', { account_id: 'a', content: '喜欢摇滚' });
+  assert.equal(created.code, 201);
+  assert.equal(created.body.manual, true);
+  const list = await request('GET', '/chat/memories');
+  assert.equal(list.body.memories.length, 1);
+  const edited = await request('PUT', `/chat/memories/${created.body.id}`, { account_id: 'a', content: '喜欢爵士' });
+  assert.equal(edited.code, 200);
+  assert.equal(edited.body.content, '喜欢爵士');
+  const missing = await request('PUT', '/chat/memories/nope', { account_id: 'a', content: 'x' });
+  assert.equal(missing.code, 400);
+  assert.equal((await request('DELETE', `/chat/memories/${created.body.id}`)).code, 200);
+  assert.equal((await request('GET', '/chat/memories')).body.memories.length, 0);
+  const other = await request('GET', '/chat/memories', undefined, 'account_id=b');
+  assert.equal(other.body.memories.length, 0, '账号 b 不受 a 的写入影响');
 });
-test('HTTP history pagination/order, retention, independent account scope, delete and reset', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const h = routesOf(t);
+
+test('history delete removes the turn and clears summary', async (t) => {
+  const { request, memory } = routesOf(t);
+  await memory.saveTurn('a', turnOf('t1'), qaConfigOf());
+  await memory.mutate('a', value => { value.summary = '摘要'; });
+  const list = await request('GET', '/chat/history');
+  assert.equal(list.body.total, 1);
+  assert.equal(list.body.summary, '摘要');
+  assert.equal((await request('DELETE', '/chat/history/t1')).code, 200);
+  const after = await request('GET', '/chat/history');
+  assert.equal(after.body.total, 0);
+  assert.equal(after.body.summary, '');
+  assert.equal((await request('DELETE', '/chat/history/ghost')).code, 400);
+});
+
+test('clear and reset operate on the requesting account only', async (t) => {
+  const { request, memory } = routesOf(t);
+  await memory.saveTurn('a', turnOf('ta'), qaConfigOf());
+  await memory.saveTurn('b', turnOf('tb'), qaConfigOf());
+  await memory.editMemory('a', '事实一');
+  assert.equal((await request('POST', '/chat/clear', { account_id: 'a', range: 'bogus' })).code, 400);
+  assert.equal((await request('POST', '/chat/clear', { account_id: 'a', range: 'all' })).code, 200);
+  assert.equal((await memory.load('a')).history.length, 0);
+  assert.equal((await memory.load('a')).memories.length, 0);
+  assert.equal((await memory.load('b')).history.length, 1, '账号 b 的历史保留');
+  await memory.saveTurn('a', turnOf('ta2'), qaConfigOf());
+  assert.equal((await request('POST', '/chat/reset', { account_id: 'a' })).code, 200);
+  const value = await memory.load('a');
+  assert.ok(value.context_since > 0, 'reset 推进上下文起点');
+  assert.ok(value.history.length === 1, 'reset 保留历史记录本身');
+});
+
+test('history listing honors limit/offset and day retention', async (t) => {
+  const { request, memory } = routesOf(t);
   for (let i = 0; i < 5; i++)
-    await h.chat.memory.saveTurn(scope, turnOf(String(i)), configOf());
-  await h.chat.memory.editMemory(scope, '手工偏好');
-  const query = new URLSearchParams({ ...target, limit: '2', offset: '1' }).toString();
-  assert.deepEqual((await h.request('GET', '/chat/history', undefined, query)).body.history.map(t => t.id), ['3', '2']);
-  assert.equal((await h.request('GET', '/chat/history', undefined, 'account_id=b&device_id=d')).body.total, 0);
-  assert.equal((await h.request('DELETE', '/chat/history/missing')).code, 400);
-  assert.equal((await h.request('DELETE', '/chat/history/4')).code, 200);
-  await flush();
-  assert.equal((await h.request('GET', '/chat/history')).body.total, 4);
-  assert.equal((await h.request('POST', '/chat/reset', target)).code, 200);
-  const value = await h.chat.memory.load(scope);
-  assert.equal(value.summary, '');
-  assert.equal(value.history.length, 4);
-  assert.equal(value.memories.length, 1);
+    await memory.saveTurn('a', turnOf(`t${i}`), qaConfigOf());
+  await memory.mutate('a', value => { value.history[0].created_at = Date.now() - 40 * 86400000; });
+  const page = await request('GET', '/chat/history', undefined, 'account_id=a&limit=2&offset=0');
+  assert.equal(page.body.total, 4, '超过保留天数的轮次不计');
+  assert.equal(page.body.history.length, 2);
+  const next = await request('GET', '/chat/history', undefined, 'account_id=a&limit=2&offset=2');
+  assert.equal(next.body.history.length, 2);
+  assert.notEqual(page.body.history[0].id, next.body.history[0].id);
 });
-test('HTTP memory CRUD and each clear range preserve the intended data', async (t) => {
-  const h = routesOf(t);
-  let response = await h.request('POST', '/chat/memories', { ...target, content: ' 偏好 ' });
-  assert.equal(response.code, 201);
-  const id = response.body.id;
-  assert.equal((await h.request('PUT', `/chat/memories/${id}`, { ...target, content: '新的偏好' })).body.manual, true);
-  assert.equal((await h.request('PUT', `/chat/memories/${id}`, { ...target, content: 2 })).code, 400);
-  assert.equal((await h.request('GET', '/chat/memories')).body.memories[0].content, '新的偏好');
-  assert.equal((await h.request('DELETE', `/chat/memories/${id}`)).code, 200);
-  assert.equal((await h.request('DELETE', `/chat/memories/${id}`)).code, 400);
-  for (const range of ['history', 'memory', 'all']) {
-    await h.chat.memory.saveTurn(scope, turnOf('turn'), configOf());
-    await h.chat.memory.editMemory(scope, '偏好');
-    const cleared = await h.request('POST', '/chat/clear', { ...target, range });
-    assert.equal(cleared.code, 200);
-    const value = await h.chat.memory.load(scope);
-    assert.equal(value.history.length, range === 'memory' ? 1 : 0);
-    assert.equal(value.memories.length, range === 'history' ? 1 : 0);
-    await h.chat.memory.clear(scope, 'all');
-  }
-});
-for (const result of ['valid', '401', '500', 'malformed', 'bad-json']) {
-  test(`HTTP model list ${result}`, async (t) => {
-    const h = routesOf(t);
-    t.mock.method(globalThis, 'fetch', async (_url, options) => {
-      assert.equal(options.headers.Authorization, 'Bearer test-only');
-      if (result === '401' || result === '500')
-        return new Response('', { status: Number(result) });
-      if (result === 'bad-json')
-        return new Response('bad');
-      return Response.json(result === 'malformed' ? { data: {} } : { data: [{ id: 'm' }, null, { id: 7 }] });
-    });
-    const response = await h.request('GET', '/chat/models');
-    assert.equal(response.code, result === 'valid' ? 200 : 400);
-    if (result === 'valid')
-      assert.deepEqual(response.body.models, [{ id: 'm' }]);
-  });
-}
-test('memory migrates old checkpoints, prunes TTL, preserves snapshots and limits preferences', async (t) => {
-  const { values } = storageOf(t), memory = new ChatMemoryService();
-  const old = { version: 1, revision: 0, context_since: 0, summary: '', summary_sources: [], history: [turnOf('expired', { created_at: Date.now() - 31 * 86400000 })], memories: [{ id: 'm', content: '旧偏好', source_ids: ['old'], manual: false, created_at: 1, updated_at: 1 }] };
-  values.set('chat:v1:s', JSON.stringify(old));
-  assert.deepEqual((await memory.load('s')).extracted_sources, ['old']);
-  await memory.saveTurn('s', turnOf('new'), configOf());
-  const copy = await memory.load('s');
-  copy.history.length = 0;
-  assert.equal((await memory.load('s')).history.length, 1);
-  for (let i = 0; i < 99; i++)
-    await memory.editMemory('s', `偏好${i}`);
-  await assert.rejects(memory.editMemory('s', '溢出'), /100/);
-  await memory.editMemory('s', '编辑仍可保存', 'm');
-  assert.equal((await memory.load('s')).memories.length, 100);
-});
-function socketOf() {
-  const frames = [], closes = [], events = {};
-  return { OPEN: 1, readyState: 1, frames, closes, events, async send(frame) { frames.push(JSON.parse(frame)); }, async close(...args) { closes.push(args); }, onClose(fn) { events.close = fn; }, onError(fn) { events.error = fn; } };
-}
-test('WebSocket sends initial snapshot, isolates accounts/devices and unsubscribes on close/error', async (t) => {
-  const h = routesOf(t), socket = socketOf();
-  await handleChatWebSocket({ query: 'account_id=a&device_id=d' }, socket, h.config, h.chat);
-  assert.equal(socket.frames.length, 1);
-  assert.equal(socket.frames[0].type, 'chat_status');
-  for (const listener of h.chat.listeners) {
-    listener(chatScope('b', 'd'), { phase: 'speaking' });
-    listener(scope, { phase: 'generating' });
-  }
-  assert.equal(socket.frames.length, 2);
-  socket.readyState = 3;
-  for (const listener of h.chat.listeners)
-    listener(scope, { phase: 'completed' });
-  assert.equal(socket.frames.length, 2);
-  socket.events.close();
-  assert.equal(h.chat.listeners.size, 1); // the fixture's observer remains
-  const other = socketOf();
-  await handleChatWebSocket({ query: 'account_id=a&device_id=d' }, other, h.config, h.chat);
-  other.events.error();
-  assert.equal(h.chat.listeners.size, 1);
-});
-for (const failure of ['target', 'initial-send', 'update-send']) {
-  test(`WebSocket cleans subscriptions after ${failure}`, async (t) => {
-    const h = routesOf(t), socket = socketOf();
-    if (failure === 'initial-send')
-      socket.send = async () => { throw new Error('closed'); };
-    await handleChatWebSocket({ query: failure === 'target' ? 'account_id=missing&device_id=d' : 'account_id=a&device_id=d' }, socket, h.config, h.chat);
-    if (failure === 'update-send') {
-      socket.send = async () => { throw new Error('closed'); };
-      for (const listener of h.chat.listeners)
-        listener(scope, { phase: 'speaking' });
-      await flush();
-    }
-    else
-      assert.equal(socket.closes[0][0], 1008);
-    assert.equal(h.chat.listeners.size, 1);
-  });
-}

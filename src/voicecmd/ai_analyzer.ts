@@ -10,7 +10,7 @@ import { aiRequestHeaders } from '../utils/ai_headers';
 import { canDisableDashScopeThinking } from '../utils/ai_thinking';
 
 /** AI System Prompt */
-const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSON：{"action":"...","params":{...},"confidence":"high|medium|low","rawText":"有效文本"}
+const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，只返回JSON：{"action":"...","params":{...},"confidence":"high|medium|low"}
 
 行为和参数（只允许使用以下参数，不要自定义新字段）：
 - play_song: name(歌曲名), artist(歌手名)
@@ -24,6 +24,7 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 - query_sleep_timer: 查询定时剩余时间
 - resume: 继续/恢复播放
 - next/previous/stop/unknown
+- qa: 与音乐完全无关的指令（知识问答/聊天/天气/时间/讲笑话/控制家电等）。插件会转交问答接管流程处理
 
 规则：
 1. "XX的YY"中XX是歌手名则artist=XX,name=YY，否则整句为歌名（如"你的答案"→name）
@@ -31,29 +32,23 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 3. 翻唱以演唱者（翻唱者）为artist，原唱忽略。如"陈奕迅翻唱周杰伦的淘汰"→name="淘汰",artist="陈奕迅"
 4. "来一首"等同于"播放"，划入play_song
 5. 明确high模糊low其余medium
-6. rawText去语气词、口癖词
-7. "播放XX的歌/歌曲/音乐"或"来几首XX"中，name为泛称（歌/歌曲/音乐/曲/曲子）或无name时→action=play_artist,artist=XX。name为具体歌名时仍为play_song
+6. "播放XX的歌/歌曲/音乐"或"来几首XX"中，name为泛称（歌/歌曲/音乐/曲/曲子）或无name时→action=play_artist,artist=XX。name为具体歌名时仍为play_song
+7. 不能明确归入上述音乐操作的指令一律返回qa，params留空，不要猜测
 
 示例：
-周杰伦的晴天→{"action":"play_song","params":{"name":"晴天","artist":"周杰伦"},"confidence":"high","rawText":"周杰伦 晴天"}
-邓紫棋翻唱周杰伦的龙卷风→{"action":"play_song","params":{"name":"龙卷风","artist":"邓紫棋"},"confidence":"high","rawText":"龙卷风 邓紫棋"}
-播放周杰伦的歌→{"action":"play_artist","params":{"artist":"周杰伦"},"confidence":"high","rawText":"周杰伦"}
-我想听林俊杰的歌曲→{"action":"play_artist","params":{"artist":"林俊杰"},"confidence":"high","rawText":"林俊杰"}
-来几首邓紫棋→{"action":"play_artist","params":{"artist":"邓紫棋"},"confidence":"high","rawText":"邓紫棋"}
-随机播放→{"action":"set_play_mode","params":{"mode":"random"},"confidence":"high","rawText":"随机播放"}
-收藏这首歌→{"action":"favorite","params":{"action":"add"},"confidence":"high","rawText":"收藏这首歌"}
-取消收藏→{"action":"favorite","params":{"action":"remove"},"confidence":"high","rawText":"取消收藏"}
-半小时后停止播放→{"action":"sleep_timer","params":{"duration":30},"confidence":"high","rawText":"半小时后停止播放"}
-30分钟后关闭→{"action":"sleep_timer","params":{"duration":30},"confidence":"high","rawText":"30分钟后关闭"}
-一个半小时后停→{"action":"sleep_timer","params":{"duration":90},"confidence":"high","rawText":"一个半小时后停"}
-再听3首就停→{"action":"sleep_timer","params":{"songs_count":3},"confidence":"high","rawText":"再听3首就停"}
-5首歌后停止播放→{"action":"sleep_timer","params":{"songs_count":5},"confidence":"high","rawText":"5首歌后停止播放"}
-取消定时→{"action":"cancel_sleep_timer","params":{},"confidence":"high","rawText":"取消定时"}
-还有多久停→{"action":"query_sleep_timer","params":{},"confidence":"high","rawText":"还有多久停"}
-继续播放→{"action":"resume","params":{},"confidence":"high","rawText":"继续播放"}
-恢复播放→{"action":"resume","params":{},"confidence":"high","rawText":"恢复播放"}
-播放第300首→{"action":"play_index","params":{"index":300},"confidence":"high","rawText":"播放第300首"}
-跳到第五十首→{"action":"play_index","params":{"index":50},"confidence":"high","rawText":"跳到第50首"}`;
+周杰伦的晴天→{"action":"play_song","params":{"name":"晴天","artist":"周杰伦"},"confidence":"high"}
+播放周杰伦的歌→{"action":"play_artist","params":{"artist":"周杰伦"},"confidence":"high"}
+播放我的歌单→{"action":"play_playlist","params":{"playlist":"我的歌单"},"confidence":"high"}
+随机播放→{"action":"set_play_mode","params":{"mode":"random"},"confidence":"high"}
+收藏这首歌→{"action":"favorite","params":{"action":"add"},"confidence":"high"}
+半小时后停止播放→{"action":"sleep_timer","params":{"duration":30},"confidence":"high"}
+再听3首就停→{"action":"sleep_timer","params":{"songs_count":3},"confidence":"high"}
+取消定时→{"action":"cancel_sleep_timer","params":{},"confidence":"high"}
+继续播放→{"action":"resume","params":{},"confidence":"high"}
+播放第300首→{"action":"play_index","params":{"index":300},"confidence":"high"}
+今天天气怎么样→{"action":"qa","params":{},"confidence":"high"}
+地球为什么是圆的→{"action":"qa","params":{},"confidence":"high"}
+打开客厅的灯→{"action":"qa","params":{},"confidence":"high"}`;
 
 /**
  * AI 口令分析器

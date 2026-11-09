@@ -1,0 +1,6 @@
+{
+  "_comment": "由 scripts/sync-upstream.sh 维护：最后一次成功合入的官方上游提交。请勿手工改动，除非明确知道在做什么。",
+  "upstreamRepo": "https://github.com/songloft-org/songloft-plugin-miot.git",
+  "upstreamBranch": "main",
+  "lastSyncedSha": "1379528daab3841e7e3ca0edb05d14046ff14a17"
+}

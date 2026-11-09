@@ -61,6 +61,7 @@ const uiIconCodePoints: Record<string, number> = {
   favorite: 0xe87e,
   favorite_border: 0xe87e,
   format_list_numbered: 0xe242,
+  forum: 0xe0bf,
   group: 0xea21,
   info: 0xe88e,
   inbox: 0xe156,

@@ -42,6 +42,10 @@ const { MusicCommandService: VoiceEngine } = loadSource('../src/music/service.ts
   '../group/coordinator': {},
   '../player/url_builder': {},
   '../voicecmd/ai_analyzer': {},
+  '../voicecmd/qa_fallback': { QAFallback: class { } },
+  '../chat/memory': { ChatMemoryService: class { } },
+  '../ai/client': { AIClient: class { } },
+  '../ws/conversation-stream': { notifyConversationOutcome: () => { } },
   '../voicecmd/online_searcher': {},
   '../handlers/playlist': {},
   '../utils/http': {},
@@ -65,7 +69,8 @@ function createEngine(commands = defaults.getDefaultVoiceCommands()) {
   };
   engine.accountManager = { getAccounts: async () => [{ id: 'account' }] };
   engine.memoryService = { setMaxRecords: async () => { } };
-  engine.onlineSearcher = { isExternalSearchConfigured: async () => false };
+  // Object.create 跳过构造器，补上 QA 兜底依赖（未接管 → 走原有流程）
+  engine.qaFallback = { handle: async () => ({ handled: false, outcome: 'none' }), testQA: async () => null };
   engine.playlistManagerMap = { get: () => undefined, cancelHourlyResumes: () => { } };
   engine.indexingManager = {
     waitForReady: async () => true,
@@ -352,7 +357,8 @@ for (const name of ['继续听', '取消收藏歌曲', '不存在的歌单']) {
       assert.deepEqual(speech, [`未找到歌单：${name}`]);
       assert.ok(warnings.includes(`[MusicCommandService] Playlist not found: ${name} (indexReady=true playlists=2 refreshing=false)`));
     } else {
-      assert.deepEqual(plays, [[name === '继续听' ? 7 : 8, 0, 'order']]);
+      // 本仓库默认播放模式为列表循环（README「默认列表循环」），上游默认 order
+      assert.deepEqual(plays, [[name === '继续听' ? 7 : 8, 0, 'loop']]);
       assert.deepEqual(speech, []);
     }
   });

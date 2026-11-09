@@ -1095,9 +1095,11 @@ export class MinaHTTPClient {
 
       // 转换为 AskMessage 格式（与 WASM 版一致）
       const messages = dataObj.records.map(record => {
-        // 从 answers 中找到 TTS 类型的回答，安全访问 tts.text
-        const ttsAnswer = (record.answers || []).find(a => a.type === 'TTS');
-        const answerText = ttsAnswer?.tts?.text || '';
+        // 原生回答文本：优先 TTS 类型；部分新固件用 LLM 类型承载回答（mi-song-gpt 补充），
+        // 缺失时 QA 问答接管会误判"小爱没回答"而重复作答
+        const answerItem = (record.answers || []).find(a => a.type === 'TTS')
+          || (record.answers || []).find(a => a.type === 'LLM');
+        const answerText = answerItem?.tts?.text || answerItem?.llm?.text || '';
         return {
           timestamp_ms: record.time,
           response: {

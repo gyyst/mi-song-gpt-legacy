@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const frontendRoot = path.resolve(new URL('..', import.meta.url).pathname);
+// Windows 下 URL.pathname 形如 /D:/…，path.resolve 会拼出 D:\D:\… 导致整套契约测试跑不起来
+const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const sourceRoot = path.join(frontendRoot, 'src');
-const read = (file) => fs.readFileSync(path.join(sourceRoot, file), 'utf8');
+const read = (file) => fs.readFileSync(path.join(sourceRoot, file), 'utf8').replace(/\r\n/g, '\n'); // Windows(CRLF) checkout 下契约正则按 LF 匹配
 
 const api = read('api.ts');
 const store = read('store.ts');
@@ -14,10 +16,10 @@ const settingsPage = read('views/SettingsPage.vue');
 const rootApp = read('App.vue');
 const runtime = read('runtime.ts');
 const appBar = read('views/AppBar.vue');
-const publicIcon = fs.readFileSync(path.join(frontendRoot, 'public/icon.svg'), 'utf8');
+const publicIcon = read('../public/icon.svg');
 const switchComponent = read('ui/SlSwitch.vue');
 const sliderComponent = read('ui/SlSlider.vue');
-const viteConfig = fs.readFileSync(path.join(frontendRoot, 'vite.config.ts'), 'utf8');
+const viteConfig = read('../vite.config.ts');
 const selectComponent = read('ui/SlSelect.vue');
 const slListView = read('ui/SlListView.vue');
 const slButton = read('ui/SlButton.vue');
@@ -35,6 +37,16 @@ const playerPalette = read('playerPalette.ts');
 const voiceSettings = read('views/settings/VoiceSettings.vue');
 const scheduleSettings = read('views/settings/ScheduleSettings.vue');
 const modePopup = read('views/PlayerModePopup.vue');
+
+assert.ok(store.includes('export function sortConversationDesc'), 'store 必须导出对话记录降序排序助手');
+assert.ok(store.includes('export function upsertConversationMessage'), 'store 必须导出对话记录 upsert 助手');
+assert.ok(store.includes('state.conversationMessages = sortConversationDesc('), 'HTTP 轮询刷新必须过降序排序');
+assert.ok(voiceSettings.includes('state.conversationMessages = sortConversationDesc('), 'WS 快照帧必须过降序排序');
+assert.ok(voiceSettings.includes('upsertConversationMessage(state.conversationMessages, frame.data)'), 'WS 增量帧必须走 upsert（防重复 + 降序）');
+assert.ok(voiceSettings.includes('outcome_detail === \'web_search\''), '大模型接管且尝试联网时 meta 行末尾须标注（web_search）');
+assert.ok(/const aiConnState = ref</.test(voiceSettings), 'VoiceSettings must declare aiConnState (AI pipeline chip source)');
+assert.ok(/const aiConnLatency = ref</.test(voiceSettings), 'VoiceSettings must declare aiConnLatency');
+assert.ok(voiceSettings.includes('void probeAiConnection()'), 'VoiceSettings must probe AI connection on mount');
 const speedPopup = read('views/PlayerSpeedPopup.vue');
 const toolboxSettings = read('views/settings/ToolboxSettings.vue');
 const volumePopup = read('views/PlayerVolumePopup.vue');
@@ -112,6 +124,7 @@ assert.match(voiceSectionNav, /update:modelValue/);
 assert.match(voiceSettings, /<VoiceSectionNav/);
 assert.match(voiceSettings, /data-voice-panel="listen"/);
 assert.match(voiceSettings, /data-voice-panel="intelligence"/);
+assert.match(voiceSettings, /<AISettings/);
 assert.match(playerBar, /role="slider"/);
 assert.match(playerBar, /onProgressKeydown/);
 assert.match(playerBar, /onBarSurfaceClick/);
@@ -587,6 +600,7 @@ assert.match(slIcon, /uiIconCodePoints/);
 assert.match(slIcon, /props\.playerIcon \? playerIconCodePoints : uiIconCodePoints/);
 assert.match(slIcon, /settings: 0xe8b8/);
 assert.match(slIcon, /construction: 0xea3c/);
+assert.match(slIcon, /forum: 0xe0bf/);
 assert.match(slIcon, /'sl-icon-ui'/);
 assert.doesNotMatch(modePopup, /looks_one_outlined/);
 assert.match(style, /\.player-favorite-button\.player-control-active \.sl-icon[^}]*font-variation-settings: 'FILL' 1/);

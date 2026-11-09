@@ -1,53 +1,161 @@
 name: Release Plugin
 
+# 自动发布：
+# - 推送 v* 标签时自动构建并发布对应版本；
+# - 也可以在 Actions 页面手动触发，版本号留空时使用日期版本 YYYY.M.D。
+#
+# 发布后会把构建产物里的 plugin.json（version / download_url / updateUrl / 哈希）
+# 与 package.json 回写到 main，Songloft 通过 plugin.json 的 updateUrl 检查更新。
+
 on:
   push:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - '**/*.mdx'
-      - 'docs/**'
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（留空则自动使用日期版本 YYYY.M.D）'
+        required: false
+        default: ''
 
 permissions:
   contents: write
 
-# 排队并逐一补发未处理的业务提交，避免连续推送或批量推送丢包。
 concurrency:
   group: release-plugin
-  queue: max
   cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 30
     steps:
-      - name: Checkout plugin
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          path: plugins/src/miot
           fetch-depth: 0
 
-      - name: Checkout SDK source for contract tests
-        uses: actions/checkout@v4
-        with:
-          repository: songloft-org/plugin-toolchain
-          path: plugins/toolchain
-          persist-credentials: false
-
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 20
           cache: npm
           cache-dependency-path: |
-            plugins/src/miot/package-lock.json
-            plugins/src/miot/frontend/package-lock.json
+            package-lock.json
+            frontend/package-lock.json
 
-      - name: Build, verify and publish each pending commit
-        working-directory: plugins/src/miot
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="${INPUT_VERSION#v}"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            VERSION="${REF_NAME#v}"
+          else
+            VERSION="$(TZ='Asia/Shanghai' date +'%Y.%-m.%-d')"
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9A-Za-z][0-9A-Za-z._-]*$'; then
+            echo "::error::无效的版本号: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "发布版本: $VERSION"
+
+      - name: Prepare manifest
+        id: manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          ENTRY_PATH="$(node -p "require('./plugin.json').entryPath")"
+          ZIP_NAME="${ENTRY_PATH}.jsplugin.zip"
+          TAG="v${VERSION}"
+          DOWNLOAD_URL="https://github.com/${REPOSITORY}/releases/download/${TAG}/${ZIP_NAME}"
+          UPDATE_URL="https://raw.githubusercontent.com/${REPOSITORY}/main/plugin.json"
+          export VERSION DOWNLOAD_URL UPDATE_URL
+          node -e "
+            const fs = require('fs');
+            const plugin = JSON.parse(fs.readFileSync('plugin.json', 'utf8'));
+            plugin.version = process.env.VERSION;
+            plugin.download_url = process.env.DOWNLOAD_URL;
+            plugin.updateUrl = process.env.UPDATE_URL;
+            fs.writeFileSync('plugin.json', JSON.stringify(plugin, null, 2) + '\n');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          {
+            echo "entry_path=$ENTRY_PATH"
+            echo "zip_name=$ZIP_NAME"
+            echo "tag=$TAG"
+            echo "download_url=$DOWNLOAD_URL"
+          } >> "$GITHUB_OUTPUT"
+          echo "产物: dist/${ZIP_NAME}"
+          echo "下载地址: ${DOWNLOAD_URL}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npx vite build
+
+      - name: Build and validate
+        run: |
+          npm run build
+          npm run validate
+
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PLUGIN_TOOLCHAIN_PATH: ${{ github.workspace }}/plugins/toolchain
-        run: node scripts/release-plugin.mjs
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.manifest.outputs.tag }}
+          ZIP_NAME: ${{ steps.manifest.outputs.zip_name }}
+        run: |
+          NOTES="自动构建的 mi-song-gpt 插件 v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist/${ZIP_NAME}" --clobber
+            gh release edit "$TAG" --title "v${VERSION}" --notes "$NOTES"
+          else
+            gh release create "$TAG" "dist/${ZIP_NAME}" \
+              --title "v${VERSION}" \
+              --notes "$NOTES" \
+              --target "$GITHUB_SHA"
+          fi
+
+      - name: Commit release metadata to main
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+
+          # 标签指向历史提交时，避免把旧版本的哈希写回最新的 main。
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            echo "::warning::当前提交不是 main 最新提交，跳过 plugin.json 回写"
+            exit 0
+          fi
+
+          # 保存构建后的清单（version / download_url / updateUrl / entryHash / zipHash）。
+          cp plugin.json /tmp/release-plugin.json
+          cp package.json /tmp/release-package.json
+          git checkout -B main origin/main
+          cp /tmp/release-plugin.json plugin.json
+          cp /tmp/release-package.json package.json
+          git add plugin.json package.json
+
+          if git diff --staged --quiet; then
+            echo "清单无变化，无需提交"
+            exit 0
+          fi
+
+          git commit -m "chore(release): v${VERSION}"
+          git push origin main
+          echo "已回写版本与更新地址: v${VERSION}"

@@ -45,7 +45,7 @@ export function aiChatCompletionsUrl(apiUrl: string): string {
   return base ? `${base}/chat/completions` : '';
 }
 
-/** Responses endpoint on the same versioned connection base. */
+/** Responses API 端点：POST /v1/responses（火山方舟 web_search 联网搜索用） */
 export function aiResponsesUrl(apiUrl: string): string {
   const base = normalizeAiBaseUrl(apiUrl);
   return base ? `${base}/responses` : '';

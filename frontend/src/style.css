@@ -457,6 +457,7 @@ h1, h2, h3, p { margin: 0; }
 .list-item-copy { min-width: 0; flex: 1; }
 .list-item-title, .list-item-subtitle { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .list-item-subtitle { color: var(--md-on-surface-variant); font-size: 12px; }
+.list-item-meta { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--md-on-surface-variant); font-size: 12px; opacity: 0.85; }
 .list-item > .sl-button, .list-item > .switch, .list-item > .chip { flex: 0 0 auto; }
 .chip { display: inline-flex; align-items: center; min-height: 28px; padding: 0 10px; border-radius: var(--md-radius-sm); background: var(--md-surface-container-high); color: var(--md-on-surface-variant); font-size: 12px; white-space: nowrap; }
 .chip-success { background: var(--md-success-container); color: var(--md-success); }
